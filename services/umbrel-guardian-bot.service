@@ -1,0 +1,27 @@
+[Unit]
+Description=Umbrel Guardian Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=umbrel
+WorkingDirectory=/home/umbrel/umbrel/umbrel-guardian
+# Brief delay so DNS/networking is fully ready after network-online.target
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/python3 /home/umbrel/umbrel/umbrel-guardian/bot/guardian_bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+PrivateTmp=yes
+ProtectSystem=strict
+NoNewPrivileges=yes
+ReadWritePaths=/home/umbrel/umbrel/umbrel-guardian
+MemoryMax=128M
+CPUQuota=20%
+
+[Install]
+WantedBy=multi-user.target

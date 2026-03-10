@@ -1,0 +1,9 @@
+[Unit]
+Description=Umbrel Guardian — watch for manual backup trigger
+
+[Path]
+PathExists=/home/umbrel/umbrel/umbrel-guardian/.backup-trigger
+Unit=umbrel-guardian-backup.service
+
+[Install]
+WantedBy=multi-user.target

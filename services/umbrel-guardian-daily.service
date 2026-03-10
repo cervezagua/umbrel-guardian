@@ -1,0 +1,12 @@
+[Unit]
+Description=Umbrel Guardian Daily Status Summary
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=umbrel
+ExecStart=/bin/bash -c \
+    '/home/umbrel/umbrel/umbrel-guardian/scripts/system_status.sh | \
+     /home/umbrel/umbrel/umbrel-guardian/scripts/telegram_send.sh'
+StandardOutput=journal
+StandardError=journal

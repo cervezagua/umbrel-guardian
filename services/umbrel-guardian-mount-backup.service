@@ -1,0 +1,22 @@
+[Unit]
+Description=Umbrel Guardian — Auto-mount backup drive by label
+# Run after Umbrel has finished setting up its data drive.
+# This service handles boot-time mounting; udev handles hot-plug.
+After=umbrel-external-storage.service local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Delegate to the deployed mount script (patched and copied to /usr/local/bin/
+# by reinstall-services.sh). The script is idempotent and exits cleanly if
+# the backup drive is not plugged in.
+ExecStart=/usr/local/bin/mount-umbrel-backup.sh
+
+ExecStop=/bin/bash -c '\
+    MOUNT="@@BACKUP_PATH@@"; \
+    mountpoint -q "$MOUNT" && umount "$MOUNT" || true'
+
+[Install]
+WantedBy=multi-user.target

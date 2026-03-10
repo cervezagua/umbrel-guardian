@@ -1,0 +1,10 @@
+[Unit]
+Description=Umbrel Guardian Backup
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutSec=7200
+ExecStart=/home/umbrel/umbrel/umbrel-guardian/scripts/backup.sh
+StandardOutput=journal
+StandardError=journal

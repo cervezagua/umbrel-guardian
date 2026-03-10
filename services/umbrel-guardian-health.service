@@ -1,0 +1,12 @@
+[Unit]
+Description=Umbrel Guardian Health Check
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=umbrel
+ExecStart=/home/umbrel/umbrel/umbrel-guardian/scripts/health_check.sh
+StandardOutput=journal
+StandardError=journal
+# Exit 1 means "alerts were sent" — treat as success so the timer keeps running
+SuccessExitStatus=0 1

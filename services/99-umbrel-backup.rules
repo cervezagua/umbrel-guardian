@@ -1,0 +1,3 @@
+# Umbrel Guardian — auto-mount backup drive when plugged in.
+# Triggers the mount script whenever a partition labeled "umbrel-backup" appears.
+ACTION=="add", ENV{ID_FS_LABEL}=="umbrel-backup", RUN+="/usr/local/bin/mount-umbrel-backup.sh"
