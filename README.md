@@ -43,7 +43,7 @@ Runs directly on the host — no Umbrel app store required, no modifications to 
 ## 🚀 Install
 
 ```bash
-git clone https://github.com/yourname/umbrel-guardian
+git clone https://github.com/cervezagua/umbrel-guardian
 cd umbrel-guardian
 sudo bash install.sh
 ```
