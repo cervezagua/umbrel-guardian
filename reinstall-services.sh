@@ -70,6 +70,7 @@ if [ -n "${BACKUP_PATH:-}" ]; then
 
         # Deploy udev rule for hot-plug auto-mount
         cp "$INSTALL_DIR/services/99-umbrel-backup.rules" /etc/udev/rules.d/
+        chmod 644 /etc/udev/rules.d/99-umbrel-backup.rules
         udevadm control --reload-rules 2>/dev/null || true
 
         # Simplified systemd service (calls the deployed mount script)
