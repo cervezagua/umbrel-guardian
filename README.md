@@ -292,7 +292,9 @@ Umbrel OS only supports **one external drive at boot**. If a second drive is plu
 
 **Umbrel Guardian's solution:** A **udev rule** detects the backup drive by filesystem label and auto-mounts it — both at boot (via systemd service) and when **hot-plugged** (via udev). Both drives stay plugged in safely during normal operation.
 
-> ⚠️ **Before shutting down:** Unplug the backup drive first. Umbrel (Rugpi) cannot determine which drive is the data drive when two drives are connected at boot. The correct workflow is: **shut down** (not reboot) -> unplug backup drive -> boot -> plug backup drive back in (auto-mounted by udev).
+> ⚠️ **Before shutting down:** Unplug the backup drive first. Umbrel (Rugpi) cannot determine which drive is the data drive when two drives are connected at boot. The correct workflow is: **shut down** (not reboot) → unplug backup drive → boot → plug backup drive back in (auto-mounted by udev).
+
+**Implementation note:** Modern `systemd-udevd` runs `RUN` handlers in a sandboxed mount namespace, so calling `mount` directly from a udev rule fails silently. The udev rule uses `systemd-run --no-block` to spawn the mount script as a transient systemd unit **outside** the sandbox, where mount works normally.
 
 ```bash
 # Label your backup drive (one-time, no formatting needed):
@@ -331,6 +333,8 @@ Guardian survives this because:
 
 1. 📂 Install directory lives under `/home` (bind-mounted from persistent data partition)
 2. 🔧 `umbrel-guardian-bootstrap.service` is written to `/etc/systemd/system/` by `reinstall-services.sh`. It detects when Guardian services are missing after an OTA wipe and re-installs them automatically.
+
+The bootstrap reinstaller also re-deploys the **udev rule** to `/etc/udev/rules.d/` and the **mount script** to `/usr/local/bin/` — both of which live on the root filesystem and are wiped by OTA updates.
 
 No manual intervention needed after an Umbrel OS update.
 
