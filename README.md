@@ -17,18 +17,8 @@ Runs directly on the host — no Umbrel app store required, no modifications to 
 | 🔌 **Backup Drive Auto-Mount** | udev hot-plug + boot service — mount backup drive automatically |
 | 🔐 **Access Control** | Authorized users list + safe mode with PIN lock |
 | 🛡 **Security Hardened** | Rate limiting, input validation, sandboxed systemd services |
-<a href="https://github.com/user-attachments/assets/3c7bec98-ebce-4bf7-8b66-5a631f2cc8b8">
-    <img width="168" height="320" alt="Screenshot 1" src="https://github.com/user-attachments/assets/3c7bec98-ebce-4bf7-8b66-5a631f2cc8b8" />
-  </a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/user-attachments/assets/6924c11a-00c8-4b90-ab68-c0c85a52e43b">
-    <img width="168" height="320" alt="Screenshot 2" src="https://github.com/user-attachments/assets/6924c11a-00c8-4b90-ab68-c0c85a52e43b" />
-  </a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/user-attachments/assets/786fada5-ac94-44dd-bef3-59e82679ee24">
-    <img width="168" height="320" alt="Screenshot 3" src="https://github.com/user-attachments/assets/786fada5-ac94-44dd-bef3-59e82679ee24" />
-  </a>
-  
+  <img width="168" height="320" alt="image" src="https://github.com/user-attachments/assets/8b5e26e1-40b3-4820-b062-32818f930692" />
+
 ---
 
 ## 📋 Requirements
