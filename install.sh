@@ -275,19 +275,22 @@ done
 
 mkdir -p "$INSTALL_DIR"/{bot,scripts,services}
 
-# Use /. (not /*) so the copy works regardless of directory contents
-# and avoids glob-expansion failures under set -e when there are no matches.
-cp -r "$SOURCE_DIR/bot/."      "$INSTALL_DIR/bot/"
-cp -r "$SOURCE_DIR/scripts/."  "$INSTALL_DIR/scripts/"
-cp -r "$SOURCE_DIR/services/." "$INSTALL_DIR/services/"
-cp    "$SOURCE_DIR/reinstall-services.sh" "$INSTALL_DIR/"
-cp    "$SOURCE_DIR/uninstall.sh"          "$INSTALL_DIR/"
+if [ "$SOURCE_DIR" != "$INSTALL_DIR" ]; then
+    # Use /. (not /*) so the copy works regardless of directory contents
+    # and avoids glob-expansion failures under set -e when there are no matches.
+    cp -r "$SOURCE_DIR/bot/."      "$INSTALL_DIR/bot/"
+    cp -r "$SOURCE_DIR/scripts/."  "$INSTALL_DIR/scripts/"
+    cp -r "$SOURCE_DIR/services/." "$INSTALL_DIR/services/"
+    cp    "$SOURCE_DIR/reinstall-services.sh" "$INSTALL_DIR/"
+    cp    "$SOURCE_DIR/uninstall.sh"          "$INSTALL_DIR/"
+    ok "Files copied to $INSTALL_DIR"
+else
+    ok "Running from install directory — skipping copy"
+fi
 
 chmod +x "$INSTALL_DIR/scripts/"*.sh
 chmod +x "$INSTALL_DIR/reinstall-services.sh"
 chmod +x "$INSTALL_DIR/uninstall.sh"
-
-ok "Files copied to $INSTALL_DIR"
 
 # ─ Write config ──────────────────────────────────────────────────────────────
 CONFIG="$INSTALL_DIR/config.env"
