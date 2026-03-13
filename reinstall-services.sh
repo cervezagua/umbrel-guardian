@@ -48,9 +48,7 @@ cp "$INSTALL_DIR/services/umbrel-guardian-daily.timer"   "$SYSTEMD_DIR/"
 
 # Backup (only if configured)
 if [ -n "${BACKUP_PATH:-}" ]; then
-    sed "s|^After=.*|&\nConditionPathIsMountPoint=${BACKUP_PATH}|" \
-        "$INSTALL_DIR/services/umbrel-guardian-backup.service" \
-        > "$SYSTEMD_DIR/umbrel-guardian-backup.service"
+    cp "$INSTALL_DIR/services/umbrel-guardian-backup.service" "$SYSTEMD_DIR/"
 
     BACKUP_TIME="${BACKUP_TIME:-02:00}"
     sed "s|OnCalendar=.*|OnCalendar=*-*-* ${BACKUP_TIME}:00|" \
