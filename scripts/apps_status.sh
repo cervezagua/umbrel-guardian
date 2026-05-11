@@ -63,10 +63,25 @@ done <<< "$APP_STATES"
 echo "📦 Installed Apps"
 echo "━━━━━━━━━━━━━━━━━━"
 
+# Use umbreld's app list as the authoritative source — uninstalled apps may
+# leave data directories behind in app-data/, and we don't want to show those.
+# Fall back to filesystem enumeration only if umbreld returned no apps.
+APP_IDS=()
+if [ "${#UMBREL_STATE[@]}" -gt 0 ]; then
+    APP_IDS=("${!UMBREL_STATE[@]}")
+else
+    for app_dir in "$APP_DATA"/*/; do
+        [ -d "$app_dir" ] || continue
+        APP_IDS+=("$(basename "$app_dir")")
+    done
+fi
+
+# Sort for deterministic output
+mapfile -t APP_IDS < <(printf "%s\n" "${APP_IDS[@]}" | sort)
+
 FOUND=0
-for app_dir in "$APP_DATA"/*/; do
-    [ -d "$app_dir" ] || continue
-    app_id=$(basename "$app_dir")
+for app_id in "${APP_IDS[@]}"; do
+    [ -n "$app_id" ] || continue
     FOUND=$((FOUND + 1))
 
     state="${UMBREL_STATE[$app_id]:-}"
