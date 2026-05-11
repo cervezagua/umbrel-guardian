@@ -86,9 +86,14 @@ for app_id in "${APP_IDS[@]}"; do
 
     state="${UMBREL_STATE[$app_id]:-}"
 
+    # Telegram bot commands only accept [a-zA-Z0-9_]: dashes break the auto-link.
+    # Convert dashes to underscores for the tappable shortcut; restart_app.sh
+    # reverses this when looking up the app id.
+    shortcut="/restart_${app_id//-/_}"
+
     # Intentional off (user stopped it) — show but don't flag
     if [ "$state" = "stopped" ]; then
-        echo "⏸ $app_id  (stopped)"
+        echo "⏸ $app_id  (stopped) — $shortcut"
         continue
     fi
 
@@ -106,9 +111,9 @@ for app_id in "${APP_IDS[@]}"; do
     if [ -z "$app_lines" ]; then
         # No containers found — fall back to whatever umbreld says
         if [ -n "$state" ]; then
-            echo "❌ $app_id  ($state, no containers)"
+            echo "❌ $app_id  ($state, no containers) — $shortcut"
         else
-            echo "❌ $app_id  (no containers)"
+            echo "❌ $app_id  (no containers) — $shortcut"
         fi
         continue
     fi
@@ -117,12 +122,12 @@ for app_id in "${APP_IDS[@]}"; do
     running=$(echo "$app_lines" | grep -c " running$" || true)
 
     if [ "$running" -eq "$total" ]; then
-        echo "✅ $app_id  (running)"
+        echo "✅ $app_id  (running) — $shortcut"
     elif [ "$running" -gt 0 ]; then
-        echo "⚠️ $app_id  (partial: $running/$total)"
+        echo "⚠️ $app_id  (partial: $running/$total) — $shortcut"
     else
         container_state=$(echo "$app_lines" | head -1 | awk '{print $NF}')
-        echo "❌ $app_id  ($container_state)"
+        echo "❌ $app_id  ($container_state) — $shortcut"
     fi
 done
 

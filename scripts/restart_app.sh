@@ -16,10 +16,13 @@ if ! command -v umbreld &>/dev/null; then
     exit 1
 fi
 
-# Verify the app exists before trying to restart.
+# Verify the app exists and resolve it to its canonical id.
+# Telegram-tappable shortcuts use underscores instead of dashes
+# (e.g. /restart_adguard_home for app id "adguard-home"), so we also try
+# the literal form with _ → - substitution as a fallback.
 # Capture all output (stdout + stderr) — umbreld may write JSON to either.
 RAW=$(umbreld client apps.list.query 2>&1) || true
-if ! echo "$RAW" | python3 -c "
+RESOLVED=$(echo "$RAW" | python3 -c "
 import sys, json
 
 raw = sys.stdin.read()
@@ -35,18 +38,28 @@ except (json.JSONDecodeError, ValueError):
         except (json.JSONDecodeError, ValueError):
             pass
 
+app = sys.argv[1]
 if apps is None:
-    sys.exit(0)  # can't validate — let the restart attempt proceed
+    # Can't validate — pass through and let the restart attempt handle it.
+    print(app)
+    sys.exit(0)
 
 ids = [a['id'] for a in apps]
-app = sys.argv[1]
-if app not in ids:
-    sys.exit(1)
-" "$APP" 2>/dev/null; then
+# Try literal first, then the _ → - substitution (Telegram-tappable form).
+for candidate in (app, app.replace('_', '-')):
+    if candidate in ids:
+        print(candidate)
+        sys.exit(0)
+sys.exit(1)
+" "$APP" 2>/dev/null) || true
+
+if [ -z "$RESOLVED" ]; then
     echo "⚠️ Unknown app ID: $APP"
     echo "Use /apps to see valid app IDs."
     exit 1
 fi
+
+APP="$RESOLVED"
 
 if umbreld client apps.restart.mutate --appId "$APP" &>/dev/null; then
     echo "✅ Restarted: $APP"
