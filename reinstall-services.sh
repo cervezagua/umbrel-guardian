@@ -54,6 +54,17 @@ if ! python3 -c "import requests" &>/dev/null; then
     fi
 fi
 
+# ── Ensure scripts are executable ────────────────────────────────────────────
+# Defense in depth: GitHub blobs preserve +x via mode 100755, but if anyone
+# ever copies/syncs files in a way that strips bits (Windows checkout with
+# core.fileMode=false, scp without -p, manual archive extract), this restores
+# them so the bot does not fail with "Permission denied".
+chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
+chmod +x "$INSTALL_DIR/reinstall-services.sh" 2>/dev/null || true
+chmod +x "$INSTALL_DIR/uninstall.sh" 2>/dev/null || true
+chmod +x "$INSTALL_DIR/install.sh" 2>/dev/null || true
+chmod +x "$INSTALL_DIR/custom-hooks/pre-start" 2>/dev/null || true
+
 # ── Clean up legacy bootstrap unit ───────────────────────────────────────────
 # The old bootstrap pattern (umbrel-guardian-bootstrap.service in /etc/systemd/system)
 # could not survive OTA — the service file itself got wiped. Replaced by the
