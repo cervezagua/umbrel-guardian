@@ -65,6 +65,17 @@ chmod +x "$INSTALL_DIR/uninstall.sh" 2>/dev/null || true
 chmod +x "$INSTALL_DIR/install.sh" 2>/dev/null || true
 chmod +x "$INSTALL_DIR/custom-hooks/pre-start" 2>/dev/null || true
 
+# ── Ensure umbrel user is in docker group ────────────────────────────────────
+# OTA updates rebuild /etc/group, removing umbrel from supplementary groups.
+# Without docker membership, the bot (User=umbrel) cannot run `docker ps`,
+# breaking /apps and /logs. usermod -aG is idempotent if already a member.
+if getent group docker &>/dev/null; then
+    if ! id -nG umbrel 2>/dev/null | grep -qw docker; then
+        usermod -aG docker umbrel
+        echo "  ✅ Added umbrel to docker group (bot service will be restarted)"
+    fi
+fi
+
 # ── Clean up legacy bootstrap unit ───────────────────────────────────────────
 # The old bootstrap pattern (umbrel-guardian-bootstrap.service in /etc/systemd/system)
 # could not survive OTA — the service file itself got wiped. Replaced by the
@@ -152,7 +163,8 @@ fi
 # ── Enable and start units ───────────────────────────────────────────────────
 systemctl daemon-reload
 systemctl enable --now umbrel-guardian-health.timer
-systemctl enable --now umbrel-guardian-bot.service
+systemctl enable umbrel-guardian-bot.service
+systemctl restart umbrel-guardian-bot.service  # restart so any group/code changes take effect
 systemctl enable --now umbrel-guardian-daily.timer
 
 if [ -n "${BACKUP_PATH:-}" ]; then
