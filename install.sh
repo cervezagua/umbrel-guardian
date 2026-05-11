@@ -266,21 +266,22 @@ ok "Health checks every: $HEALTH_INTERVAL"
 step 7 "Installing Files"
 
 # Pre-flight: verify all required source directories exist before touching anything
-for _dir in bot scripts services; do
+for _dir in bot scripts services custom-hooks; do
     if [ ! -d "$SOURCE_DIR/$_dir" ]; then
         err "Repository is incomplete — missing directory: $SOURCE_DIR/$_dir
   Make sure you cloned the full repository and all directories are present."
     fi
 done
 
-mkdir -p "$INSTALL_DIR"/{bot,scripts,services}
+mkdir -p "$INSTALL_DIR"/{bot,scripts,services,custom-hooks}
 
 if [ "$SOURCE_DIR" != "$INSTALL_DIR" ]; then
     # Use /. (not /*) so the copy works regardless of directory contents
     # and avoids glob-expansion failures under set -e when there are no matches.
-    cp -r "$SOURCE_DIR/bot/."      "$INSTALL_DIR/bot/"
-    cp -r "$SOURCE_DIR/scripts/."  "$INSTALL_DIR/scripts/"
-    cp -r "$SOURCE_DIR/services/." "$INSTALL_DIR/services/"
+    cp -r "$SOURCE_DIR/bot/."          "$INSTALL_DIR/bot/"
+    cp -r "$SOURCE_DIR/scripts/."      "$INSTALL_DIR/scripts/"
+    cp -r "$SOURCE_DIR/services/."     "$INSTALL_DIR/services/"
+    cp -r "$SOURCE_DIR/custom-hooks/." "$INSTALL_DIR/custom-hooks/"
     cp    "$SOURCE_DIR/reinstall-services.sh" "$INSTALL_DIR/"
     cp    "$SOURCE_DIR/uninstall.sh"          "$INSTALL_DIR/"
     ok "Files copied to $INSTALL_DIR"
@@ -289,6 +290,7 @@ else
 fi
 
 chmod +x "$INSTALL_DIR/scripts/"*.sh
+chmod +x "$INSTALL_DIR/custom-hooks/pre-start"
 chmod +x "$INSTALL_DIR/reinstall-services.sh"
 chmod +x "$INSTALL_DIR/uninstall.sh"
 
@@ -325,8 +327,8 @@ step 8 "Installing systemd Services"
 chmod +x "$INSTALL_DIR/reinstall-services.sh"
 
 # Use the shared reinstall script — it copies service files to /etc/systemd/system,
-# patches OnCalendar values, adds ConditionPathIsMountPoint for backup,
-# installs the bootstrap service for OTA-update resilience, and enables everything.
+# patches OnCalendar values, deploys the pre-start hook for OTA resilience,
+# ensures Python deps, and enables everything.
 bash "$INSTALL_DIR/reinstall-services.sh"
 
 ok "Services enabled and started"
@@ -334,7 +336,7 @@ ok "Services enabled and started"
 # ─ Done ──────────────────────────────────────────────────────────────────────
 echo
 echo "╔══════════════════════════════════════════╗"
-echo "║  ✅ Umbrel Guardian installed!           ║"
+echo "║  ✅ Umbrel Guardian installed!            ║"
 echo "╚══════════════════════════════════════════╝"
 echo
 echo "  Telegram bot:    systemctl status umbrel-guardian-bot"

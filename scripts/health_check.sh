@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Proactive health check: runs on a timer and sends Telegram alerts
-# if disk usage exceeds threshold or any app is not in "ready" state.
+# if disk usage exceeds threshold or any app is in an unknown/failed state.
+# (Healthy = ready or running; transient and stopped states are ignored.)
 #
 # Deduplication: alerts are only sent when the issue set *changes*,
 # preventing Telegram spam every 30 minutes for persistent problems.
@@ -46,6 +47,14 @@ if [ "${DISK_USE:-0}" -gt "$THRESHOLD" ]; then
 fi
 
 # ── App health check ────────────────────────────────────────────────────────
+# Umbrel app state taxonomy (1.7.x):
+#   ready, running                                           → healthy
+#   starting, installing, updating, restarting,              → transient
+#     stopping, uninstalling                                   (ignore — fluctuates)
+#   stopped                                                  → intentional off (user choice)
+#   unknown                                                  → real problem
+# We only alert on "unknown" so transient states don't flap and stopped
+# apps (which the user deliberately turned off) don't trigger alerts.
 if command -v umbreld &>/dev/null; then
     APP_ISSUES=$(umbreld client apps.list.query 2>&1 | python3 - <<'PYEOF'
 import sys, json
@@ -65,10 +74,15 @@ except (json.JSONDecodeError, ValueError):
 if apps is None:
     sys.exit(0)
 
+HEALTHY    = {"ready", "running"}
+TRANSIENT  = {"starting", "installing", "updating", "restarting", "stopping", "uninstalling"}
+INTENTIONAL = {"stopped"}
+
 for app in apps:
     state = app.get("state", "unknown")
-    if state != "ready":
-        print(f"❌ {app['id']} is {state}")
+    if state in HEALTHY or state in TRANSIENT or state in INTENTIONAL:
+        continue
+    print(f"❌ {app['id']} is {state}")
 PYEOF
     ) || true
 

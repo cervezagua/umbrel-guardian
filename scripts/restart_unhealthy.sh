@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# Restart all Umbrel apps that are not in "ready" state.
+# Restart Umbrel apps that are in an unhealthy state (e.g. "unknown").
+#
+# State taxonomy (Umbrel 1.7.x):
+#   ready, running                                           → healthy, skip
+#   starting, installing, updating, restarting, stopping,    → transient, skip
+#     uninstalling                                             (would race with umbreld)
+#   stopped                                                  → user turned it off, skip
+#   unknown                                                  → restart
 
 set -uo pipefail
 
@@ -29,13 +36,19 @@ except (json.JSONDecodeError, ValueError):
 if apps is None:
     sys.exit(0)
 
+HEALTHY     = {'ready', 'running'}
+TRANSIENT   = {'starting', 'installing', 'updating', 'restarting', 'stopping', 'uninstalling'}
+INTENTIONAL = {'stopped'}
+
 for a in apps:
-    if a.get('state') != 'ready':
-        print(a['id'])
+    state = a.get('state', 'unknown')
+    if state in HEALTHY or state in TRANSIENT or state in INTENTIONAL:
+        continue
+    print(a['id'])
 " 2>/dev/null) || true
 
 if [ -z "$UNHEALTHY" ]; then
-    echo "✅ All apps are healthy — nothing to restart."
+    echo "✅ No apps in unknown/failed state — nothing to restart."
     exit 0
 fi
 

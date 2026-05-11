@@ -29,6 +29,11 @@ udevadm control --reload-rules 2>/dev/null || true
 echo "Removing sudoers entry..."
 rm -f /etc/sudoers.d/umbrel-guardian
 
+echo "Removing OTA-recovery hook..."
+rm -f /home/umbrel/umbrel/custom-hooks/pre-start
+# Only remove the directory if it's empty (other tools might use it)
+rmdir /home/umbrel/umbrel/custom-hooks 2>/dev/null || true
+
 echo "Removing installation directory..."
 rm -rf "$INSTALL_DIR"
 

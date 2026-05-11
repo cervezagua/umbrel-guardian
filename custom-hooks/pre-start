@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Umbrel Guardian — pre-start hook for OTA recovery.
+#
+# Umbrel OS 1.7.x exposes /opt/umbrel-custom-hooks/run-pre-start, a wrapper
+# that runs /home/umbrel/umbrel/custom-hooks/pre-start (this file) before
+# umbreld.service starts, with a 5-minute timeout.
+#
+# On OTA updates, /etc/systemd/system/ is wiped — Guardian's units vanish.
+# But /home/umbrel/umbrel/ is bind-mounted from the persistent data
+# partition, so this script and Guardian's install dir survive. Each boot,
+# this hook detects missing units and re-runs reinstall-services.sh.
+
+set -uo pipefail
+
+INSTALL_DIR="/home/umbrel/umbrel/umbrel-guardian"
+MARKER="/etc/systemd/system/umbrel-guardian-bot.service"
+
+# Guardian not installed yet (fresh OS, no config.env) — nothing to recover.
+[ -f "$INSTALL_DIR/config.env" ] || exit 0
+
+# Units already present — nothing to do.
+[ -f "$MARKER" ] && exit 0
+
+echo "[guardian pre-start] Guardian units missing — running reinstall-services.sh"
+/bin/bash "$INSTALL_DIR/reinstall-services.sh" || {
+    echo "[guardian pre-start] reinstall-services.sh failed — continuing boot"
+    exit 0
+}
+
+echo "[guardian pre-start] Guardian services restored"
+exit 0

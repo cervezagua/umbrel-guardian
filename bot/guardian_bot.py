@@ -214,10 +214,10 @@ HELP_TEXT = r"""🛡 *Umbrel Guardian*
 *Commands:*
 /status — System overview \(disk, RAM, CPU, uptime\)
 /uptime — Show system uptime
-/apps — App states \(running\)
+/apps — App states \(ready / stopped / unknown\)
 /health — Run a health check now
 /restart \<app\_id\> — Restart a specific app
-/restart unhealthy — Restart all non\-ready apps
+/restart unhealthy — Restart apps in unknown/failed state
 /logs \<app\_id\> \[lines\] — Recent container logs \(default: 50\)
 /backup — Trigger a manual backup now
 /lock — Enable safe mode \(disable dangerous commands\)
@@ -289,7 +289,7 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
         if len(parts) < 2 or not parts[1].strip():
             send_message(
                 token, chat_id,
-                "Usage:\n/restart <app_id>\n/restart unhealthy\nExample: /restart nextcloud"
+                "Usage:\n/restart <app_id>\n/restart unhealthy\nExample: /restart bitcoin-node"
             )
             return
         arg = parts[1].strip()
@@ -309,7 +309,7 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
         parts = text.split(None, 2)
         if len(parts) < 2:
             send_message(token, chat_id,
-                         "Usage: /logs <app_id> [lines]\nExample: /logs nextcloud 30")
+                         "Usage: /logs <app_id> [lines]\nExample: /logs bitcoin-node 30")
             return
         app_id = parts[1].strip()
         if not valid_app_id(app_id):

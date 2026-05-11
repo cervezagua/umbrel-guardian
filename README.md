@@ -13,17 +13,16 @@ Runs directly on the host — no Umbrel app store required, no modifications to 
 | 🚨 **Health Alerts** | Proactive notifications for high disk usage & unhealthy apps |
 | 💾 **Automated Backups** | Daily rsync to an external drive with rotation and Telegram notifications |
 | 📊 **Daily Summary** | Morning status report delivered to Telegram at 09:00 |
-| 🔄 **OTA-Resilient** | Survives Umbrel OS updates via bootstrap service |
+| 🔄 **OTA-Resilient** | Survives Umbrel OS updates via the official pre-start hook |
 | 🔌 **Backup Drive Auto-Mount** | udev hot-plug + boot service — mount backup drive automatically |
 | 🔐 **Access Control** | Authorized users list + safe mode with PIN lock |
 | 🛡 **Security Hardened** | Rate limiting, input validation, sandboxed systemd services |
-  <img width="168" height="320" alt="image" src="https://github.com/user-attachments/assets/8b5e26e1-40b3-4820-b062-32818f930692" />
 
 ---
 
 ## 📋 Requirements
 
-- Umbrel OS (tested on **Umbrel 1.5**, Raspberry Pi 5 8 GB)
+- Umbrel OS (tested on **Umbrel 1.7.2**, Raspberry Pi 5 8 GB; compatible with 1.5+)
 - A Telegram bot token (from [@BotFather](https://t.me/BotFather))
 - Your Telegram Chat ID (from [@userinfobot](https://t.me/userinfobot))
 - *(Optional)* An external USB/SATA drive for backups
@@ -34,7 +33,7 @@ Runs directly on the host — no Umbrel app store required, no modifications to 
 
 ```bash
 cd ~/umbrel
-git clone https://github.com/cervezagua/umbrel-guardian
+sudo git clone https://github.com/yourname/umbrel-guardian
 cd umbrel-guardian
 sudo bash install.sh
 ```
@@ -48,7 +47,7 @@ The interactive installer walks you through **8 steps**:
 5. 💾 Backup drive selection (numbered menu with auto-detection)
 6. 🩺 Health monitoring interval
 7. 📦 Copy files to persistent install directory
-8. 🔧 Install & enable systemd services
+8. 🔧 Install & enable systemd services + deploy OTA-recovery hook
 
 ---
 
@@ -58,10 +57,10 @@ The interactive installer walks you through **8 steps**:
 |---|---|
 | `/status` | 🖥 System overview — disk, RAM, CPU, uptime, app count |
 | `/uptime` | ⏱ System uptime |
-| `/apps` | 📦 List all installed apps with running/stopped state |
+| `/apps` | 📦 List all installed apps with state (ready / stopped / unknown) |
 | `/health` | 🩺 Run a health check now and report results |
 | `/restart <app_id>` | 🔄 Restart a specific app by its ID |
-| `/restart unhealthy` | 🔄 Restart all apps not in "ready" state |
+| `/restart unhealthy` | 🔄 Restart apps in unknown/failed state (skips intentionally stopped apps) |
 | `/logs <app_id> [n]` | 📋 Last N lines of an app's container logs (default: 50) |
 | `/backup` | ⏳ Trigger a manual backup immediately |
 | `/lock` | 🔒 Enable safe mode — disables dangerous commands |
@@ -86,23 +85,27 @@ umbrel-guardian/
 │   ├── system_status.sh        ← System overview
 │   ├── apps_status.sh          ← App list via umbreld client / docker
 │   ├── restart_app.sh          ← Restart a single app
-│   ├── restart_unhealthy.sh    ← Restart all non-ready apps
+│   ├── restart_unhealthy.sh    ← Restart apps in unknown state (skips stopped)
 │   ├── app_logs.sh             ← App container logs (docker compose)
 │   ├── health_check.sh         ← Proactive health alerts (timer)
 │   ├── backup.sh               ← rsync backup with flock + rotation
 │   └── mount-backup.sh         ← Mount backup drive (udev + boot + safety net)
 │
-└── services/
-    ├── umbrel-guardian-bot.service              ← Always-running bot
-    ├── umbrel-guardian-health.service           ← Health check (oneshot)
-    ├── umbrel-guardian-health.timer             ← Health check schedule
-    ├── umbrel-guardian-daily.service            ← Daily summary (oneshot)
-    ├── umbrel-guardian-daily.timer              ← Daily summary at 09:00
-    ├── umbrel-guardian-backup.service           ← Backup (oneshot, runs as root)
-    ├── umbrel-guardian-backup.timer             ← Backup schedule
-    ├── umbrel-guardian-backup-trigger.path      ← Watches for manual /backup trigger
-    ├── umbrel-guardian-mount-backup.service     ← Boot-time mount fallback
-    └── 99-umbrel-backup.rules                  ← udev rule for hot-plug auto-mount
+├── services/
+│   ├── umbrel-guardian-bot.service              ← Always-running bot
+│   ├── umbrel-guardian-health.service           ← Health check (oneshot)
+│   ├── umbrel-guardian-health.timer             ← Health check schedule
+│   ├── umbrel-guardian-daily.service            ← Daily summary (oneshot)
+│   ├── umbrel-guardian-daily.timer              ← Daily summary at 09:00
+│   ├── umbrel-guardian-backup.service           ← Backup (oneshot, runs as root)
+│   ├── umbrel-guardian-backup.timer             ← Backup schedule
+│   ├── umbrel-guardian-backup-trigger.path      ← Watches for manual /backup trigger
+│   ├── umbrel-guardian-mount-backup.service     ← Boot-time mount fallback
+│   └── 99-umbrel-backup.rules                   ← udev rule for hot-plug auto-mount
+│
+└── custom-hooks/
+    └── pre-start                                ← Deployed to /home/umbrel/umbrel/custom-hooks/
+                                                  ←   for OTA-resilient service recovery
 ```
 
 ---
@@ -318,16 +321,25 @@ sudo bash /home/umbrel/umbrel/umbrel-guardian/reinstall-services.sh
 
 ## 🔄 OTA Update Resilience
 
-Umbrel OS uses A/B root partitions. OTA updates may wipe `/etc/systemd/system/`.
+Umbrel OS uses A/B root partitions. OTA updates wipe `/etc/systemd/system/`, `/usr/local/bin/`, and `/etc/udev/rules.d/` — Guardian's units, mount script, and udev rule all disappear.
 
-Guardian survives this because:
+Guardian survives this through Umbrel's **official pre-start hook**, introduced in 1.7.x:
 
-1. 📂 Install directory lives under `/home` (bind-mounted from persistent data partition)
-2. 🔧 `umbrel-guardian-bootstrap.service` is written to `/etc/systemd/system/` by `reinstall-services.sh`. It detects when Guardian services are missing after an OTA wipe and re-installs them automatically.
+1. 📂 Install directory lives under `/home/umbrel/umbrel/` (bind-mounted from the persistent data partition — survives OTA).
+2. 🪝 A small recovery script at `/home/umbrel/umbrel/custom-hooks/pre-start` is invoked on every boot by Umbrel's `umbrel-custom-pre-start.service` (wrapper at `/opt/umbrel-custom-hooks/run-pre-start`).
+3. 🔧 The hook detects when Guardian's units are missing and runs `reinstall-services.sh` — restoring all systemd units, the udev rule, the mount script, and ensuring Python's `requests` is installed (re-installed automatically after Python ABI bumps).
 
-The bootstrap reinstaller also re-deploys the **udev rule** to `/etc/udev/rules.d/` and the **mount script** to `/usr/local/bin/` — both of which live on the root filesystem and are wiped by OTA updates.
+The hook runs with a 5-minute timeout and is designed to never block umbreld from starting even if it fails. No manual intervention needed after an Umbrel OS update.
 
-No manual intervention needed after an Umbrel OS update.
+**Trigger recovery manually (for testing or forced re-install):**
+
+```bash
+sudo /opt/umbrel-custom-hooks/run-pre-start    # idempotent — no-op if units exist
+# or
+sudo bash /home/umbrel/umbrel/umbrel-guardian/reinstall-services.sh
+```
+
+> **Note:** Earlier versions of Guardian used an `umbrel-guardian-bootstrap.service` for this. That pattern failed on Umbrel 1.7.x because the bootstrap unit itself lived in `/etc/systemd/system/` and got wiped along with everything else. `reinstall-services.sh` now removes any stale bootstrap unit it finds.
 
 ---
 
@@ -358,6 +370,18 @@ sudo bash /home/umbrel/umbrel/umbrel-guardian/reinstall-services.sh
 # 🗑 Uninstall
 sudo bash /home/umbrel/umbrel/umbrel-guardian/uninstall.sh
 ```
+
+---
+
+## 🔄 Update
+
+```bash
+cd ~/umbrel/umbrel-guardian
+sudo git pull
+sudo bash reinstall-services.sh
+```
+
+Pulls the latest code and re-deploys systemd services. Your `config.env` is not tracked by git and won't be overwritten.
 
 ---
 

@@ -6,16 +6,27 @@
 # /home/umbrel/umbrel/umbrel-guardian/ survives because /home is bind-mounted
 # from the persistent data partition.
 #
-# Run this after an OTA update to restore Guardian services:
-#   sudo bash /home/umbrel/umbrel/umbrel-guardian/reinstall-services.sh
+# Recovery on Umbrel 1.7.x is automatic via the official pre-start hook:
+#   /opt/umbrel-custom-hooks/run-pre-start  (Umbrel-provided wrapper)
+#     → /home/umbrel/umbrel/custom-hooks/pre-start  (deployed by this script)
+#     → this script (reinstall-services.sh)
 #
-# Or call it from install.sh with --headless to skip prompts.
+# Manual recovery: sudo bash /home/umbrel/umbrel/umbrel-guardian/reinstall-services.sh
 
 set -euo pipefail
 
 INSTALL_DIR="/home/umbrel/umbrel/umbrel-guardian"
 SYSTEMD_DIR="/etc/systemd/system"
 CONFIG="$INSTALL_DIR/config.env"
+CUSTOM_HOOKS_DIR="/home/umbrel/umbrel/custom-hooks"
+
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+
+if [ "$EUID" -ne 0 ]; then
+    echo "❌ This script must be run as root (it writes to /etc/systemd/system)."
+    echo "   Try: sudo bash $0"
+    exit 1
+fi
 
 if [ ! -f "$CONFIG" ]; then
     echo "❌ config.env not found at $CONFIG"
@@ -27,6 +38,33 @@ fi
 source "$CONFIG"
 
 echo "🛡 Umbrel Guardian — Reinstalling systemd services..."
+
+# ── Python dependency check ──────────────────────────────────────────────────
+# Umbrel OS major upgrades bump Python (e.g. 3.11 → 3.13 between 1.5 and 1.7.2),
+# which loses prior pip-installed packages. Re-ensure `requests` is importable.
+if ! python3 -c "import requests" &>/dev/null; then
+    echo "  ⚠️  python3 requests module missing — installing..."
+    if apt-get install -y python3-requests &>/dev/null; then
+        echo "  ✅ Installed python3-requests via apt"
+    elif python3 -m pip install --quiet --break-system-packages requests &>/dev/null; then
+        echo "  ✅ Installed requests via pip (--break-system-packages)"
+    else
+        echo "  ❌ Could not install requests. Bot service will fail."
+        echo "     Try manually: sudo apt install python3-requests"
+    fi
+fi
+
+# ── Clean up legacy bootstrap unit ───────────────────────────────────────────
+# The old bootstrap pattern (umbrel-guardian-bootstrap.service in /etc/systemd/system)
+# could not survive OTA — the service file itself got wiped. Replaced by the
+# pre-start hook in /home/umbrel/umbrel/custom-hooks/ (persistent).
+if [ -f "$SYSTEMD_DIR/umbrel-guardian-bootstrap.service" ]; then
+    systemctl disable umbrel-guardian-bootstrap.service 2>/dev/null || true
+    rm -f "$SYSTEMD_DIR/umbrel-guardian-bootstrap.service"
+    echo "  🧹 Removed legacy bootstrap service"
+fi
+
+# ── Install unit files ───────────────────────────────────────────────────────
 
 # Health check
 cp "$INSTALL_DIR/services/umbrel-guardian-health.service" "$SYSTEMD_DIR/"
@@ -78,25 +116,6 @@ if [ -n "${BACKUP_PATH:-}" ]; then
     fi
 fi
 
-# Bootstrap service — ensures Guardian survives future OTA updates too
-cat > "$SYSTEMD_DIR/umbrel-guardian-bootstrap.service" <<'UNIT'
-[Unit]
-Description=Umbrel Guardian Bootstrap (re-install services after OTA update)
-DefaultDependencies=no
-Before=umbrel-guardian-bot.service umbrel-guardian-health.timer
-After=local-fs.target
-ConditionPathExists=/home/umbrel/umbrel/umbrel-guardian/config.env
-ConditionPathExists=!/etc/systemd/system/umbrel-guardian-bot.service
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash /home/umbrel/umbrel/umbrel-guardian/reinstall-services.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
 # Clean up old sudoers entry if present (no longer needed — using .path unit now)
 rm -f /etc/sudoers.d/umbrel-guardian 2>/dev/null || true
 
@@ -104,8 +123,23 @@ rm -f /etc/sudoers.d/umbrel-guardian 2>/dev/null || true
 # watches for it and starts umbrel-guardian-backup.service.  No sudo needed.
 cp "$INSTALL_DIR/services/umbrel-guardian-backup-trigger.path" "$SYSTEMD_DIR/"
 
+# ── Deploy OTA-recovery hook ─────────────────────────────────────────────────
+# Umbrel 1.7.x looks for /home/umbrel/umbrel/custom-hooks/pre-start at boot.
+# That directory is bind-mounted from the persistent data partition, so the
+# hook survives OTA. On each boot, the hook re-runs this script if Guardian's
+# units are missing.
+if [ -f "$INSTALL_DIR/custom-hooks/pre-start" ]; then
+    mkdir -p "$CUSTOM_HOOKS_DIR"
+    cp "$INSTALL_DIR/custom-hooks/pre-start" "$CUSTOM_HOOKS_DIR/pre-start"
+    chmod +x "$CUSTOM_HOOKS_DIR/pre-start"
+    chown -R umbrel:umbrel "$CUSTOM_HOOKS_DIR"
+    echo "  ✅ Deployed OTA-recovery hook → $CUSTOM_HOOKS_DIR/pre-start"
+else
+    echo "  ⚠️  custom-hooks/pre-start not found in install dir — OTA recovery disabled"
+fi
+
+# ── Enable and start units ───────────────────────────────────────────────────
 systemctl daemon-reload
-systemctl enable umbrel-guardian-bootstrap.service  2>/dev/null || true
 systemctl enable --now umbrel-guardian-health.timer
 systemctl enable --now umbrel-guardian-bot.service
 systemctl enable --now umbrel-guardian-daily.timer
