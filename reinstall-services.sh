@@ -41,16 +41,30 @@ echo "🛡 Umbrel Guardian — Reinstalling systemd services..."
 
 # ── Python dependency check ──────────────────────────────────────────────────
 # Umbrel OS major upgrades bump Python (e.g. 3.11 → 3.13 between 1.5 and 1.7.2),
-# which loses prior pip-installed packages. Re-ensure `requests` is importable.
+# losing pip-installed packages. Reboots on rugpi can also reset /etc and the
+# apt cache, so we run `apt-get update` if the first install attempt fails.
 if ! python3 -c "import requests" &>/dev/null; then
     echo "  ⚠️  python3 requests module missing — installing..."
+    install_ok=0
     if apt-get install -y python3-requests &>/dev/null; then
-        echo "  ✅ Installed python3-requests via apt"
-    elif python3 -m pip install --quiet --break-system-packages requests &>/dev/null; then
-        echo "  ✅ Installed requests via pip (--break-system-packages)"
+        install_ok=1
+    else
+        # apt cache may be stale or empty after a reboot — refresh and retry.
+        echo "  ↻  apt-get install failed; refreshing apt lists and retrying..."
+        if apt-get update &>/dev/null && apt-get install -y python3-requests &>/dev/null; then
+            install_ok=1
+        elif python3 -m pip install --quiet --break-system-packages requests &>/dev/null; then
+            install_ok=1
+            echo "  ✅ Installed requests via pip (--break-system-packages)"
+        fi
+    fi
+    if [ "$install_ok" = "1" ]; then
+        # Only print apt-success here so the message reflects which path won
+        python3 -c "import requests" &>/dev/null && \
+            echo "  ✅ Installed python3-requests"
     else
         echo "  ❌ Could not install requests. Bot service will fail."
-        echo "     Try manually: sudo apt install python3-requests"
+        echo "     Try manually: sudo apt-get update && sudo apt-get install -y python3-requests"
     fi
 fi
 
