@@ -76,6 +76,22 @@ if getent group docker &>/dev/null; then
     fi
 fi
 
+# ── Bump inotify watch limits (system-wide) ──────────────────────────────────
+# Umbrel 1.7.x consumes more inotify watches than 1.5; default limits cause
+# .path units (including umbrel-guardian-backup-trigger.path AND systemd's own
+# systemd-ask-password-console.path) to fail with "inotify watch limit reached".
+# OTA wipes /etc/sysctl.d/, so we re-deploy on each reinstall.
+SYSCTL_CONF=/etc/sysctl.d/40-inotify-umbrel.conf
+if [ ! -f "$SYSCTL_CONF" ]; then
+    cat > "$SYSCTL_CONF" <<'SYSCTL_EOF'
+fs.inotify.max_user_watches=524288
+fs.inotify.max_user_instances=512
+SYSCTL_EOF
+    sysctl --system &>/dev/null || true
+    systemctl reset-failed umbrel-guardian-backup-trigger.path 2>/dev/null || true
+    echo "  ✅ Bumped inotify limits via $SYSCTL_CONF"
+fi
+
 # ── Clean up legacy bootstrap unit ───────────────────────────────────────────
 # The old bootstrap pattern (umbrel-guardian-bootstrap.service in /etc/systemd/system)
 # could not survive OTA — the service file itself got wiped. Replaced by the

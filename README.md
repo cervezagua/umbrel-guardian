@@ -57,15 +57,28 @@ The interactive installer walks you through **8 steps**:
 |---|---|
 | `/status` | 🖥 System overview — disk, RAM, CPU, uptime, app count |
 | `/uptime` | ⏱ System uptime |
-| `/apps` | 📦 List all installed apps with state (ready / stopped / unknown) |
+| `/apps` | 📦 List installed apps with state — each line has a tappable `/restart_<id>` shortcut |
 | `/health` | 🩺 Run a health check now and report results |
-| `/restart <app_id>` | 🔄 Restart a specific app by its ID |
+| `/restart <app_id>` | 🔄 Restart a specific app. Accepts prefix matches (e.g. `/restart adguard` resolves to `adguard-home`) |
 | `/restart unhealthy` | 🔄 Restart apps in unknown/failed state (skips intentionally stopped apps) |
 | `/logs <app_id> [n]` | 📋 Last N lines of an app's container logs (default: 50) |
 | `/backup` | ⏳ Trigger a manual backup immediately |
 | `/lock` | 🔒 Enable safe mode — disables dangerous commands |
 | `/unlock <PIN>` | 🔓 Disable safe mode |
 | `/help` | ❓ Show available commands |
+
+### `/restart` resolution
+
+The app id can be given in any of these forms:
+
+| You send | Resolves to | How |
+|---|---|---|
+| `/restart adguard-home` | `adguard-home` | exact match |
+| `/restart adguard` | `adguard-home` | prefix match (unique) |
+| `/restart_adguard_home` | `adguard-home` | tappable shortcut from `/apps`; underscores swapped to dashes |
+| `/restart n` | _ambiguous_ | matches both `nextcloud` and `nostr-relay` — bot lists both as tappable suggestions |
+
+`/apps` emits a `/restart_<id>` link after each app line; tapping it sends the right command. Telegram only auto-links commands matching `[a-zA-Z0-9_]`, so dashes in app ids are rewritten to underscores in the link and reversed at lookup.
 
 ---
 
@@ -327,7 +340,14 @@ Guardian survives this through Umbrel's **official pre-start hook**, introduced 
 
 1. 📂 Install directory lives under `/home/umbrel/umbrel/` (bind-mounted from the persistent data partition — survives OTA).
 2. 🪝 A small recovery script at `/home/umbrel/umbrel/custom-hooks/pre-start` is invoked on every boot by Umbrel's `umbrel-custom-pre-start.service` (wrapper at `/opt/umbrel-custom-hooks/run-pre-start`).
-3. 🔧 The hook detects when Guardian's units are missing and runs `reinstall-services.sh` — restoring all systemd units, the udev rule, the mount script, and ensuring Python's `requests` is installed (re-installed automatically after Python ABI bumps).
+3. 🔧 The hook detects when Guardian's units are missing and runs `reinstall-services.sh`, which restores everything that an OTA wipes:
+   - all `umbrel-guardian-*` systemd units in `/etc/systemd/system/`
+   - the udev rule at `/etc/udev/rules.d/99-umbrel-backup.rules`
+   - the mount script at `/usr/local/bin/mount-umbrel-backup.sh`
+   - Python's `requests` module (OTA bumps Python and loses pip-installed packages — re-installed via `apt`)
+   - `umbrel` user's membership in the `docker` group (OTA rebuilds `/etc/group` and drops supplementary memberships)
+   - executable bits on Guardian's scripts (defense against mode-stripping copies)
+   - inotify watch limits in `/etc/sysctl.d/40-inotify-umbrel.conf` (Umbrel 1.7.x consumes more watches than the stock kernel limits allow; without this, `.path` units fail with "inotify watch limit reached")
 
 The hook runs with a 5-minute timeout and is designed to never block umbreld from starting even if it fails. No manual intervention needed after an Umbrel OS update.
 
