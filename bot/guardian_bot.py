@@ -312,17 +312,22 @@ def _execute_system_command(cmd, token, chat_id):
 
     spec = SYSTEM_COMMANDS[cmd]
     send_message(token, chat_id, spec["ack"])
+    # /restart_docker takes 30-90s to stop+start all Umbrel containers;
+    # shutdown/reboot/cancel return almost instantly. 180s covers all cases
+    # comfortably and prevents spurious "timed out" messages while the
+    # underlying systemctl is still doing real work.
+    timeout_sec = 180
     try:
         # sudoers grants NOPASSWD for `system_control.sh <action>` exactly
         result = subprocess.run(
             ["sudo", "-n", _SYSTEM_CONTROL_SH, spec["action"]],
-            capture_output=True, text=True, timeout=15
+            capture_output=True, text=True, timeout=timeout_sec
         )
         if result.returncode != 0:
             msg = result.stderr.strip() or result.stdout.strip() or "(no output)"
             send_message(token, chat_id, f"❌ {cmd} failed (exit {result.returncode}):\n{msg}")
     except subprocess.TimeoutExpired:
-        send_message(token, chat_id, f"⚠️ {cmd} timed out after 15s.")
+        send_message(token, chat_id, f"⚠️ {cmd} timed out after {timeout_sec}s (action may still be running).")
     except Exception as e:
         send_message(token, chat_id, f"❌ {cmd} error: {e}")
 

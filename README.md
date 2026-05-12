@@ -383,6 +383,28 @@ sudo bash /home/umbrel/umbrel/umbrel-guardian/reinstall-services.sh
 
 ---
 
+## 🩹 Troubleshooting
+
+### `⚠️ partial: 1/2` for adguard-home / plex / tailscale (Umbrel 1.7.x bug)
+
+Symptom: in `/apps`, host-network apps such as `adguard-home`, `plex`, and `tailscale` show as `⚠️ partial: 1/2`. The app's main container is running; the Tor sidecar (`<app>-tor_server-1`) is stuck in a restart loop.
+
+Cause (Umbrel-side, not Guardian): umbreld's torrc generator points each app's `HiddenServicePort` at `app_proxy_<appname>`, but host-mode apps never spawn an `app_proxy` companion container. Tor can't resolve the target hostname and fails with `Unparseable address in hidden service port configuration`. Verify with:
+
+```bash
+sudo docker logs <app>-tor_server-1 --tail 20
+sudo docker ps -a --format '{{.Names}}' | grep app_proxy    # only bridged apps appear here
+```
+
+Workarounds:
+
+- **Wait for an Umbrel fix** — file upstream at [github.com/getumbrel/umbrel/issues](https://github.com/getumbrel/umbrel/issues). Guardian is reporting the issue correctly; the apps themselves still work on your LAN.
+- **Disable Tor per affected app** via the Umbrel UI if your version supports it, or set `torEnabled: false` globally in `umbrel.yaml` to silence all sidecars (loses *all* `.onion` access).
+
+Once Umbrel ships a fix, the sidecars come up cleanly and the `partial` warning disappears with no Guardian change needed.
+
+---
+
 ## 🛠 Useful Commands
 
 ```bash
