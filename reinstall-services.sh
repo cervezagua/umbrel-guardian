@@ -204,11 +204,12 @@ rm -f /etc/sudoers.d/umbrel-guardian 2>/dev/null || true
 # watches for it and starts umbrel-guardian-backup.service.  No sudo needed.
 cp "$INSTALL_DIR/services/umbrel-guardian-backup-trigger.path" "$SYSTEMD_DIR/"
 
-# ── Deploy OTA-recovery hook ─────────────────────────────────────────────────
-# Umbrel 1.7.x looks for /home/umbrel/umbrel/custom-hooks/pre-start at boot.
-# That directory is bind-mounted from the persistent data partition, so the
-# hook survives OTA. On each boot, the hook re-runs this script if Guardian's
-# units are missing.
+# ── Deploy OTA-recovery hook (SSD-overlay path) ─────────────────────────────
+# Umbrel 1.7.x's wrapper at /opt/umbrel-custom-hooks/run-pre-start looks for
+# /home/umbrel/umbrel/custom-hooks/pre-start at boot. The path lives on the
+# SSD overlay during normal operation, so this copy is for post-boot manual
+# invocation and for situations where the SSD is mounted before the wrapper
+# runs (e.g., systems without external storage).
 if [ -f "$INSTALL_DIR/custom-hooks/pre-start" ]; then
     mkdir -p "$CUSTOM_HOOKS_DIR"
     cp "$INSTALL_DIR/custom-hooks/pre-start" "$CUSTOM_HOOKS_DIR/pre-start"
@@ -217,6 +218,54 @@ if [ -f "$INSTALL_DIR/custom-hooks/pre-start" ]; then
     echo "  ✅ Deployed OTA-recovery hook → $CUSTOM_HOOKS_DIR/pre-start"
 else
     echo "  ⚠️  custom-hooks/pre-start not found in install dir — OTA recovery disabled"
+fi
+
+# ── Deploy the hook to the SD-card layer (pre-mount path) ───────────────────
+# On Umbrel 1.7.x, /home/umbrel/umbrel is bind-mounted from an external SSD
+# (e.g. /dev/sda1) by umbrel-external-storage.service. That service runs in
+# PARALLEL with umbrel-custom-pre-start.service, not before it — so when the
+# wrapper checks /home/umbrel/umbrel/custom-hooks/pre-start, it usually sees
+# the empty SD-card-side mount point, not the SSD's content.
+#
+# Fix: also drop our hook on the SD-card layer at the equivalent path. The
+# wrapper finds it pre-mount, runs it, and the hook polls until the SSD
+# mount completes (config.env appears) before invoking the recovery.
+#
+# This is only needed when /home and /home/umbrel/umbrel are on different
+# devices. On systems where they share a partition (no external storage),
+# the SSD-overlay deployment above is sufficient.
+if [ -f "$INSTALL_DIR/custom-hooks/pre-start" ]; then
+    HOME_SRC=$(findmnt -n -o SOURCE /home 2>/dev/null || true)
+    UMBREL_SRC=$(findmnt -n -o SOURCE /home/umbrel/umbrel 2>/dev/null || true)
+    HOME_DEV=$(echo "$HOME_SRC" | sed 's/\[.*\]//')
+    UMBREL_DEV=$(echo "$UMBREL_SRC" | sed 's/\[.*\]//')
+    HOME_SUBPATH=$(echo "$HOME_SRC" | grep -oP '\[\K[^]]+' || true)
+
+    if [ -n "$HOME_DEV" ] && [ -b "$HOME_DEV" ] \
+        && [ -n "$UMBREL_DEV" ] && [ "$HOME_DEV" != "$UMBREL_DEV" ]; then
+        # Different devices — SD card overlay scenario. Mount the SD card
+        # partition at a temporary location and drop the hook on its layer.
+        SD_RAW=$(mktemp -d /tmp/guardian-sd-XXXXXX)
+        if mount "$HOME_DEV" "$SD_RAW" 2>/dev/null; then
+            # The SD-card-side equivalent of /home/foo is "$SD_RAW$HOME_SUBPATH/foo".
+            SD_HOOK_PARENT="$SD_RAW${HOME_SUBPATH}/umbrel/umbrel"
+            if [ -d "$SD_HOOK_PARENT" ]; then
+                SD_HOOK_DIR="$SD_HOOK_PARENT/custom-hooks"
+                mkdir -p "$SD_HOOK_DIR"
+                cp "$INSTALL_DIR/custom-hooks/pre-start" "$SD_HOOK_DIR/pre-start"
+                chmod +x "$SD_HOOK_DIR/pre-start"
+                echo "  ✅ Deployed pre-mount hook → SD-card layer ($HOME_DEV)"
+            else
+                echo "  ⚠️  SD-card path $SD_HOOK_PARENT not found — skipping pre-mount hook"
+            fi
+            umount "$SD_RAW" 2>/dev/null || umount -l "$SD_RAW" 2>/dev/null || true
+        else
+            echo "  ⚠️  Could not mount $HOME_DEV for SD-card hook deployment"
+        fi
+        rmdir "$SD_RAW" 2>/dev/null || true
+    else
+        echo "  ℹ️  /home and /home/umbrel/umbrel on same device — pre-mount hook not needed"
+    fi
 fi
 
 # ── Enable and start units ───────────────────────────────────────────────────

@@ -1,24 +1,50 @@
 #!/usr/bin/env bash
-# Umbrel Guardian — pre-start hook for OTA recovery.
+# Umbrel Guardian — pre-start hook for OTA + reboot recovery.
 #
 # Umbrel OS 1.7.x exposes /opt/umbrel-custom-hooks/run-pre-start, a wrapper
 # that runs /home/umbrel/umbrel/custom-hooks/pre-start (this file) before
 # umbreld.service starts, with a 5-minute timeout.
 #
-# On OTA updates, /etc/systemd/system/ is wiped — Guardian's units vanish.
-# But /home/umbrel/umbrel/ is bind-mounted from the persistent data
-# partition, so this script and Guardian's install dir survive. Each boot,
-# this hook detects missing units and re-runs reinstall-services.sh.
+# Timing wrinkle: umbrel-custom-pre-start.service runs in PARALLEL with
+# umbrel-external-storage.service (which bind-mounts /dev/sda1 onto
+# /home/umbrel/umbrel). Both depend on local-fs.target + are Before=umbrel.service,
+# but neither orders against the other — so at the moment this hook is invoked,
+# the SSD usually hasn't mounted yet and /home/umbrel/umbrel/ is the empty
+# SD-card-side mount point.
+#
+# This hook is deployed to BOTH layers:
+#   1. /home/umbrel/umbrel/custom-hooks/pre-start  (on the SSD — visible post-mount)
+#   2. The same path on the SD-card layer (mmcblk0p7's
+#      /state/default/persist/data/umbrel-os/home/umbrel/umbrel/custom-hooks/pre-start) —
+#      this is what the wrapper actually finds at boot, before the SSD mounts.
+#
+# Both copies run the same logic: poll until the SSD's config.env appears,
+# then run reinstall-services.sh if Guardian's units are missing.
 
 set -uo pipefail
 
 INSTALL_DIR="/home/umbrel/umbrel/umbrel-guardian"
+CONFIG="$INSTALL_DIR/config.env"
 MARKER="/etc/systemd/system/umbrel-guardian-bot.service"
 
-# Guardian not installed yet (fresh OS, no config.env) — nothing to recover.
-[ -f "$INSTALL_DIR/config.env" ] || exit 0
+# Wait up to 2 minutes for the SSD to mount onto /home/umbrel/umbrel.
+# The wrapper's timeout is 5 minutes by default, so we stay well within budget.
+# 2-second poll is small enough to keep boot fast on success.
+TIMEOUT=120
+while [ "$TIMEOUT" -gt 0 ]; do
+    [ -f "$CONFIG" ] && break
+    sleep 2
+    TIMEOUT=$((TIMEOUT - 2))
+done
 
-# Units already present — nothing to do.
+if [ ! -f "$CONFIG" ]; then
+    # Either Guardian isn't installed, or the SSD never mounted within 2 minutes.
+    # Either way nothing to do — let boot continue.
+    echo "[guardian pre-start] $CONFIG not visible after 2 min; nothing to recover"
+    exit 0
+fi
+
+# Units already present — idempotent no-op.
 [ -f "$MARKER" ] && exit 0
 
 echo "[guardian pre-start] Guardian units missing — running reinstall-services.sh"
