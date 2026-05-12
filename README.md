@@ -63,9 +63,26 @@ The interactive installer walks you through **8 steps**:
 | `/restart unhealthy` | 🔄 Restart apps in unknown/failed state (skips intentionally stopped apps) |
 | `/logs <app_id> [n]` | 📋 Last N lines of an app's container logs (default: 50) |
 | `/backup` | ⏳ Trigger a manual backup immediately |
+| `/system_reboot` | 🔄 Reboot the Pi (2-step confirm; +60s grace) |
+| `/system_shutdown` | ⏻ Power off the Pi (2-step confirm; needs physical access to restart) |
+| `/restart_docker` | 🔄 Restart Docker daemon (2-step confirm; briefly interrupts all containers) |
+| `/restart_umbrel` | 🔄 Restart umbreld (2-step confirm; brief web UI outage) |
+| `/system_cancel` | ⛔ Cancel a pending reboot or shutdown (within the +60s grace window) |
 | `/lock` | 🔒 Enable safe mode — disables dangerous commands |
 | `/unlock <PIN>` | 🔓 Disable safe mode |
 | `/help` | ❓ Show available commands |
+
+### System control commands
+
+`/system_reboot`, `/system_shutdown`, `/restart_docker`, `/restart_umbrel` all use a two-step confirmation flow to prevent accidental taps:
+
+1. Send the command — bot replies with a warning and asks for confirmation
+2. Reply `<command>_confirm` (e.g. `/system_reboot_confirm`) within **30 seconds**
+3. Bot executes via a small wrapper script that runs as root via NOPASSWD sudoers
+
+If you miss the 30-second window, the confirmation expires and you have to start over. For reboot/shutdown there's an additional **60-second grace period** after confirmation during which `/system_cancel` aborts the operation.
+
+All four commands are blocked by `/lock` (you must `/unlock <PIN>` first). The sudoers entry at `/etc/sudoers.d/umbrel-guardian-system` allows *exactly* these five subcommands of `scripts/system_control.sh` — nothing else — and is re-deployed on every boot by `reinstall-services.sh` (because `/etc/sudoers.d/` is wiped each boot).
 
 ### `/restart` resolution
 

@@ -33,6 +33,57 @@ SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 _BACKOFF_INITIAL = 1
 _BACKOFF_MAX = 60
 
+# ── System control commands ──────────────────────────────────────────────────
+# Two-step confirm flow: user sends /system_reboot, bot replies asking for
+# /system_reboot_confirm within SYSTEM_CONFIRM_TIMEOUT seconds, then executes
+# via system_control.sh (run as root through sudoers NOPASSWD).
+_SYSTEM_CONTROL_SH = os.path.join(SCRIPTS_DIR, "system_control.sh")
+SYSTEM_CONFIRM_TIMEOUT = 30  # seconds
+
+SYSTEM_COMMANDS = {
+    "/system_reboot": {
+        "action": "reboot",
+        "warning": (
+            "⚠️ This will REBOOT the Pi in ~60 seconds.\n"
+            "All apps will be unavailable during the reboot."
+        ),
+        "ack": (
+            "🔄 Reboot scheduled for ~60 seconds from now.\n"
+            "Cancel with /system_cancel if you change your mind."
+        ),
+    },
+    "/system_shutdown": {
+        "action": "shutdown",
+        "warning": (
+            "⚠️ This will POWER OFF the Pi in ~60 seconds.\n"
+            "You'll need physical access to power it back on."
+        ),
+        "ack": (
+            "⏻ Shutdown scheduled for ~60 seconds from now.\n"
+            "Cancel with /system_cancel if you change your mind."
+        ),
+    },
+    "/restart_docker": {
+        "action": "restart-docker",
+        "warning": (
+            "⚠️ This will restart the Docker daemon.\n"
+            "ALL containers (apps + umbreld) will briefly stop and restart."
+        ),
+        "ack": "🔄 Restarting Docker — apps will return shortly.",
+    },
+    "/restart_umbrel": {
+        "action": "restart-umbrel",
+        "warning": (
+            "⚠️ This will restart umbreld (Umbrel's orchestration daemon).\n"
+            "The web UI will briefly be unavailable."
+        ),
+        "ack": "🔄 Restarting umbreld.",
+    },
+}
+
+# chat_id → (system_command, expires_at_epoch)
+_pending_system_confirm = {}
+
 # ── Security: input validation ────────────────────────────────────────────────
 
 _APP_ID_RE = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
@@ -220,22 +271,81 @@ HELP_TEXT = r"""🛡 *Umbrel Guardian*
 /restart unhealthy — Restart apps in unknown/failed state
 /logs \<app\_id\> \[lines\] — Recent container logs \(default: 50\)
 /backup — Trigger a manual backup now
+/system\_reboot — Reboot the Pi \(2\-step confirm\)
+/system\_shutdown — Power off the Pi \(2\-step confirm\)
+/restart\_docker — Restart Docker daemon \(2\-step confirm\)
+/restart\_umbrel — Restart umbreld \(2\-step confirm\)
+/system\_cancel — Cancel a pending reboot/shutdown
 /lock — Enable safe mode \(disable dangerous commands\)
 /unlock \<PIN\> — Disable safe mode
 /help — Show this message
 """
 
 
+def _prime_system_command(cmd, token, chat_id):
+    """Stage a system command and ask the user to confirm within the timeout."""
+    spec = SYSTEM_COMMANDS[cmd]
+    _pending_system_confirm[chat_id] = (cmd, time.time() + SYSTEM_CONFIRM_TIMEOUT)
+    confirm_cmd = f"{cmd}_confirm"
+    send_message(
+        token, chat_id,
+        f"{spec['warning']}\n\n"
+        f"Reply {confirm_cmd} within {SYSTEM_CONFIRM_TIMEOUT} seconds to proceed.\n"
+        f"Otherwise this request expires."
+    )
+
+
+def _execute_system_command(cmd, token, chat_id):
+    """Execute a previously-primed system command (after confirmation)."""
+    pending = _pending_system_confirm.get(chat_id)
+    if not pending or pending[0] != cmd:
+        send_message(token, chat_id,
+                     f"❌ No pending {cmd} to confirm.\n"
+                     f"Send {cmd} first, then {cmd}_confirm within {SYSTEM_CONFIRM_TIMEOUT}s.")
+        return
+    if pending[1] < time.time():
+        _pending_system_confirm.pop(chat_id, None)
+        send_message(token, chat_id,
+                     f"⏱ Confirmation expired. Re-issue {cmd} to start over.")
+        return
+    _pending_system_confirm.pop(chat_id, None)
+
+    spec = SYSTEM_COMMANDS[cmd]
+    send_message(token, chat_id, spec["ack"])
+    try:
+        # sudoers grants NOPASSWD for `system_control.sh <action>` exactly
+        result = subprocess.run(
+            ["sudo", "-n", _SYSTEM_CONTROL_SH, spec["action"]],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode != 0:
+            msg = result.stderr.strip() or result.stdout.strip() or "(no output)"
+            send_message(token, chat_id, f"❌ {cmd} failed (exit {result.returncode}):\n{msg}")
+    except subprocess.TimeoutExpired:
+        send_message(token, chat_id, f"⚠️ {cmd} timed out after 15s.")
+    except Exception as e:
+        send_message(token, chat_id, f"❌ {cmd} error: {e}")
+
+
+def _cancel_pending_shutdown(token, chat_id):
+    """Cancel a pending shutdown/reboot via `shutdown -c`."""
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", _SYSTEM_CONTROL_SH, "cancel"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            send_message(token, chat_id, "✅ Pending shutdown/reboot cancelled.")
+        else:
+            # shutdown -c returns non-zero when there's nothing to cancel
+            send_message(token, chat_id, "ℹ️ No pending shutdown/reboot to cancel.")
+    except Exception as e:
+        send_message(token, chat_id, f"❌ Cancel error: {e}")
+
+
 def handle_command(text, token, chat_id, chat_ids, cfg):
     """Route a Telegram command to the appropriate script."""
     text = text.strip()
-
-    # Backward-compat: /restart_nextcloud → /restart nextcloud
-    # (matches the old UmbrelGuard button style)
-    m = re.match(r'^/restart_([a-zA-Z0-9_-]+)$', text, re.IGNORECASE)
-    if m:
-        text = f"/restart {m.group(1)}"
-
     lower = text.lower()
 
     # ── Safe mode gate ────────────────────────────────────────────────────────
@@ -244,6 +354,28 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
     if _locked and lower.split()[0] not in SAFE_COMMANDS:
         send_message(token, chat_id, "🔒 Safe mode is active. Use /unlock <PIN> to restore.")
         return
+
+    # ── System control commands (must come BEFORE the /restart_<id> regex,
+    #    otherwise /restart_docker / /restart_umbrel get rewritten and routed
+    #    to restart_app.sh, which doesn't know about system services).
+    if lower in SYSTEM_COMMANDS:
+        _prime_system_command(lower, token, chat_id)
+        return
+    if lower.endswith("_confirm"):
+        primary = lower[: -len("_confirm")]
+        if primary in SYSTEM_COMMANDS:
+            _execute_system_command(primary, token, chat_id)
+            return
+    if lower == "/system_cancel":
+        _cancel_pending_shutdown(token, chat_id)
+        return
+
+    # Backward-compat: /restart_nextcloud → /restart nextcloud
+    # (matches the old UmbrelGuard button style)
+    m = re.match(r'^/restart_([a-zA-Z0-9_-]+)$', text, re.IGNORECASE)
+    if m:
+        text = f"/restart {m.group(1)}"
+        lower = text.lower()
 
     # ── Command dispatch ──────────────────────────────────────────────────────
 

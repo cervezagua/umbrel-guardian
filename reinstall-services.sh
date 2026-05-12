@@ -197,7 +197,33 @@ if [ -n "${BACKUP_PATH:-}" ]; then
     fi
 fi
 
-# Clean up old sudoers entry if present (no longer needed — using .path unit now)
+# ── Deploy sudoers for system control commands ───────────────────────────────
+# Grants the umbrel user NOPASSWD for the exact subcommands of
+# scripts/system_control.sh. The bot uses these to expose /system_reboot,
+# /system_shutdown, /restart_docker, /restart_umbrel.
+# /etc/sudoers.d/ is wiped on every boot, so we redeploy here.
+SUDOERS_FILE="/etc/sudoers.d/umbrel-guardian-system"
+TMP_SUDOERS=$(mktemp)
+cat > "$TMP_SUDOERS" <<'SUDOERS_EOF'
+# Umbrel Guardian — allow umbrel user to run system control commands without
+# a password. Scope is strictly limited to the exact subcommands listed.
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/system_control.sh reboot
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/system_control.sh shutdown
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/system_control.sh cancel
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/system_control.sh restart-docker
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/system_control.sh restart-umbrel
+SUDOERS_EOF
+# Validate with visudo before installing — a broken sudoers file breaks all sudo.
+if visudo -c -f "$TMP_SUDOERS" &>/dev/null; then
+    install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_FILE"
+    echo "  ✅ Deployed system-control sudoers → $SUDOERS_FILE"
+else
+    echo "  ❌ sudoers content failed visudo check — NOT deploying. System commands will not work."
+    visudo -c -f "$TMP_SUDOERS" || true
+fi
+rm -f "$TMP_SUDOERS"
+
+# Clean up the LEGACY sudoers file from a prior design (different filename)
 rm -f /etc/sudoers.d/umbrel-guardian 2>/dev/null || true
 
 # Manual backup trigger — the bot touches .backup-trigger, this .path unit

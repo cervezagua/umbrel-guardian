@@ -26,8 +26,9 @@ rm -f /etc/udev/rules.d/99-umbrel-backup.rules
 rm -f /usr/local/bin/mount-umbrel-backup.sh
 udevadm control --reload-rules 2>/dev/null || true
 
-echo "Removing sudoers entry..."
+echo "Removing sudoers entries..."
 rm -f /etc/sudoers.d/umbrel-guardian
+rm -f /etc/sudoers.d/umbrel-guardian-system
 
 echo "Removing OTA-recovery hook..."
 rm -f /home/umbrel/umbrel/custom-hooks/pre-start
