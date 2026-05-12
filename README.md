@@ -280,11 +280,12 @@ The bot service (`umbrel-guardian-bot.service`) runs with a minimal privilege se
 ```ini
 PrivateTmp=yes
 ProtectSystem=strict
-NoNewPrivileges=yes
 ReadWritePaths=/home/umbrel/umbrel/umbrel-guardian
 MemoryMax=128M
 CPUQuota=20%
 ```
+
+> `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to *exactly* five exact subcommands and nothing else.
 
 ### Input Validation
 

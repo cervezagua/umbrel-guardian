@@ -327,6 +327,24 @@ def _execute_system_command(cmd, token, chat_id):
         send_message(token, chat_id, f"❌ {cmd} error: {e}")
 
 
+def _sweep_pending_confirms(token):
+    """Expire stale system-command confirmations and notify their users.
+
+    Called once per poll-loop iteration. Without this, an expiry only fires
+    when the user actually attempts the corresponding _confirm command —
+    here we proactively tell them their request lapsed."""
+    now = time.time()
+    expired = []
+    for cid, (cmd, expires_at) in list(_pending_system_confirm.items()):
+        if now >= expires_at:
+            _pending_system_confirm.pop(cid, None)
+            expired.append((cid, cmd))
+    for cid, cmd in expired:
+        send_message(token, cid,
+                     f"⏱ {cmd} confirmation expired — request was not confirmed within "
+                     f"{SYSTEM_CONFIRM_TIMEOUT}s. Re-issue {cmd} if you still want to proceed.")
+
+
 def _cancel_pending_shutdown(token, chat_id):
     """Cancel a pending shutdown/reboot via `shutdown -c`."""
     try:
@@ -534,7 +552,9 @@ def main():
     backoff = _BACKOFF_INITIAL
 
     while True:
-        updates = get_updates(token, offset)
+        # Short long-poll (10s) so the periodic sweep below (for expired system
+        # command confirmations) runs ~every 10s, not every ~30s.
+        updates = get_updates(token, offset, timeout=10)
 
         if updates is None:
             # API error — back off exponentially
@@ -544,6 +564,10 @@ def main():
             continue
 
         backoff = _BACKOFF_INITIAL  # reset on successful poll
+
+        # Notify users whose system-command confirmation lapsed.
+        # Worst-case delay is one long-poll cycle (~10s), well within tolerance for a 30s timer.
+        _sweep_pending_confirms(token)
 
         for update in updates:
             # Always advance offset, even if we skip the update
