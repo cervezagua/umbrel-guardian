@@ -71,23 +71,19 @@ if ! command -v python3 &>/dev/null; then
 fi
 ok "python3 found: $(python3 --version)"
 
-# python3-venv is needed to create a working venv with pip (the stdlib venv
-# module is split off in Debian). The venv itself is created later — here we
-# just make sure the prerequisite is available so reinstall-services.sh can do its job.
-if python3 -c "import venv; venv.EnvBuilder(with_pip=True)" &>/dev/null; then
-    ok "python3-venv module available"
+# python3-venv is needed to create a working venv with pip. Note: `import venv`
+# succeeds without it (stdlib), but the ensurepip wheels needed by `python3 -m venv`
+# live in the per-version python3.X-venv package. The generic `python3-venv` is
+# a metapackage that pulls in the right version. apt-get install is idempotent.
+if apt-get install -y python3-venv &>/dev/null; then
+    ok "python3-venv ensured (apt)"
 else
-    warn "python3-venv missing — installing..."
+    # Cache may be stale on a fresh OS install — refresh and retry
+    apt-get update &>/dev/null || true
     if apt-get install -y python3-venv &>/dev/null; then
-        ok "python3-venv installed via apt"
+        ok "python3-venv ensured (apt, after update)"
     else
-        # Cache may be stale on a fresh OS install — refresh and retry
-        apt-get update &>/dev/null || true
-        if apt-get install -y python3-venv &>/dev/null; then
-            ok "python3-venv installed via apt (after update)"
-        else
-            err "Could not install python3-venv. Please run: sudo apt-get install python3-venv"
-        fi
+        err "Could not install python3-venv. Please run: sudo apt-get install python3-venv"
     fi
 fi
 

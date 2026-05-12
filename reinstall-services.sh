@@ -52,22 +52,29 @@ VENV="$INSTALL_DIR/.venv"
 VENV_PY="$VENV/bin/python3"
 
 ensure_venv() {
-    # Make sure python3-venv is available (Debian splits the stdlib venv module
-    # off; without it, `python3 -m venv` errors with "ensurepip is not available").
-    if ! python3 -c "import venv; venv.EnvBuilder(with_pip=True)" &>/dev/null; then
-        echo "  ⚠️  python3-venv missing — installing..."
-        if ! apt-get install -y python3-venv &>/dev/null; then
-            apt-get update &>/dev/null || true
-            apt-get install -y python3-venv &>/dev/null || {
-                echo "  ❌ Could not install python3-venv. Cannot create venv."
-                return 1
-            }
-        fi
-    fi
+    # On Debian, `import venv` succeeds even when the ensurepip wheels
+    # (shipped in python3.X-venv) are missing — so we can't reliably detect
+    # via import. Just attempt creation; if it fails, install python3-venv
+    # (which pulls in the version-specific python3.X-venv on Trixie+) and retry.
 
     echo "  🔧 Creating venv at $VENV..."
     rm -rf "$VENV"
-    sudo -u umbrel python3 -m venv "$VENV" || return 1
+
+    if ! sudo -u umbrel python3 -m venv "$VENV" &>/dev/null; then
+        echo "  ⚠️  venv creation failed (likely python3-venv not installed) — installing..."
+        rm -rf "$VENV"
+        if ! apt-get install -y python3-venv &>/dev/null; then
+            apt-get update &>/dev/null || true
+            apt-get install -y python3-venv &>/dev/null || {
+                echo "  ❌ Could not install python3-venv via apt."
+                return 1
+            }
+        fi
+        if ! sudo -u umbrel python3 -m venv "$VENV"; then
+            echo "  ❌ venv creation still failing after python3-venv install — see above."
+            return 1
+        fi
+    fi
 
     echo "  📦 Installing requirements into venv..."
     if ! sudo -u umbrel "$VENV/bin/pip" install --quiet --upgrade pip &>/dev/null; then
