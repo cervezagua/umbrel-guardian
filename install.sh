@@ -60,44 +60,34 @@ else
     warn "docker group not found — /logs command may not work"
 fi
 
-# ─ Python / requests check ───────────────────────────────────────────────────
-step 3 "Python Dependencies"
+# ─ Python prerequisites ──────────────────────────────────────────────────────
+# The bot's Python deps will be installed into a venv at $INSTALL_DIR/.venv/
+# by reinstall-services.sh (which runs near the end of this script). Here we
+# only verify the host has the tools needed to *create* that venv.
+step 3 "Python Prerequisites"
 
 if ! command -v python3 &>/dev/null; then
     err "python3 is not installed. Please install it first: sudo apt install python3"
 fi
 ok "python3 found: $(python3 --version)"
 
-if python3 -c "import requests" &>/dev/null; then
-    ok "requests library already installed"
+# python3-venv is needed to create a working venv with pip (the stdlib venv
+# module is split off in Debian). The venv itself is created later — here we
+# just make sure the prerequisite is available so reinstall-services.sh can do its job.
+if python3 -c "import venv; venv.EnvBuilder(with_pip=True)" &>/dev/null; then
+    ok "python3-venv module available"
 else
-    warn "requests library not found — installing now..."
-
-    # Method 1: apt — preferred on Raspberry Pi OS / Debian (no pip needed, no PEP 668 conflict)
-    if apt-get install -y python3-requests &>/dev/null 2>&1; then
-        ok "requests installed via apt"
-
-    # Method 2: pip with --break-system-packages — required on Bookworm (PEP 668)
-    elif python3 -m pip install --quiet --break-system-packages requests 2>/dev/null; then
-        ok "requests installed via pip (--break-system-packages)"
-
-    # Method 3: plain pip — works on older distros without PEP 668
-    elif python3 -m pip install --quiet requests 2>/dev/null; then
-        ok "requests installed via pip"
-
-    # Method 4: pip3 binary — some distros install it separately
-    elif pip3 install --quiet requests 2>/dev/null; then
-        ok "requests installed via pip3"
-
+    warn "python3-venv missing — installing..."
+    if apt-get install -y python3-venv &>/dev/null; then
+        ok "python3-venv installed via apt"
     else
-        warn "Could not install requests automatically."
-        echo "  Try one of these manually, then re-run install.sh:"
-        echo
-        echo "    sudo apt install python3-requests"
-        echo "    python3 -m pip install --break-system-packages requests"
-        echo "    python3 -m pip install requests"
-        echo
-        exit 1
+        # Cache may be stale on a fresh OS install — refresh and retry
+        apt-get update &>/dev/null || true
+        if apt-get install -y python3-venv &>/dev/null; then
+            ok "python3-venv installed via apt (after update)"
+        else
+            err "Could not install python3-venv. Please run: sudo apt-get install python3-venv"
+        fi
     fi
 fi
 
@@ -284,6 +274,7 @@ if [ "$SOURCE_DIR" != "$INSTALL_DIR" ]; then
     cp -r "$SOURCE_DIR/custom-hooks/." "$INSTALL_DIR/custom-hooks/"
     cp    "$SOURCE_DIR/reinstall-services.sh" "$INSTALL_DIR/"
     cp    "$SOURCE_DIR/uninstall.sh"          "$INSTALL_DIR/"
+    cp    "$SOURCE_DIR/requirements.txt"      "$INSTALL_DIR/"
     ok "Files copied to $INSTALL_DIR"
 else
     ok "Running from install directory — skipping copy"

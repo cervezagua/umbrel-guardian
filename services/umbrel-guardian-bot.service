@@ -9,7 +9,7 @@ User=umbrel
 WorkingDirectory=/home/umbrel/umbrel/umbrel-guardian
 # Brief delay so DNS/networking is fully ready after network-online.target
 ExecStartPre=/bin/sleep 5
-ExecStart=/usr/bin/python3 /home/umbrel/umbrel/umbrel-guardian/bot/guardian_bot.py
+ExecStart=/home/umbrel/umbrel/umbrel-guardian/.venv/bin/python3 /home/umbrel/umbrel/umbrel-guardian/bot/guardian_bot.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

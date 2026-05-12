@@ -1,0 +1,12 @@
+# Runtime config and state — generated at install time / by the bot, never source-tracked
+config.env
+.backup.lock
+.backup-trigger
+
+# Python virtual environment — recreated by install.sh / reinstall-services.sh
+.venv/
+
+# General
+*.log
+__pycache__/
+*.pyc

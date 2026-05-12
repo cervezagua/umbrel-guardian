@@ -41,13 +41,13 @@ sudo bash install.sh
 The interactive installer walks you through **8 steps**:
 
 1. 🔍 Auto-detect Umbrel directory
-2. ⚙️ System prerequisites (Docker group, etc.)
-3. 🐍 Python dependency check
+2. ⚙️ System prerequisites (Docker group, `python3-venv`)
+3. 🐍 Python prerequisites (a venv is created inside the install dir in step 8)
 4. 📱 Telegram bot token + chat ID + optional safe mode PIN
 5. 💾 Backup drive selection (numbered menu with auto-detection)
 6. 🩺 Health monitoring interval
 7. 📦 Copy files to persistent install directory
-8. 🔧 Install & enable systemd services + deploy OTA-recovery hook
+8. 🔧 Install & enable systemd services + deploy OTA-recovery hook + build venv with `pip install -r requirements.txt`
 
 ---
 
@@ -89,9 +89,10 @@ umbrel-guardian/
 ├── install.sh                  ← Interactive installer
 ├── reinstall-services.sh       ← Re-install systemd services (post-OTA)
 ├── uninstall.sh                ← Clean removal
+├── requirements.txt            ← Python deps installed into .venv at install time
 │
 ├── bot/
-│   └── guardian_bot.py         ← Telegram bot (runs via systemd)
+│   └── guardian_bot.py         ← Telegram bot (runs via systemd, from .venv)
 │
 ├── scripts/
 │   ├── telegram_send.sh        ← Send a Telegram message
@@ -344,10 +345,11 @@ Guardian survives this through Umbrel's **official pre-start hook**, introduced 
    - all `umbrel-guardian-*` systemd units in `/etc/systemd/system/`
    - the udev rule at `/etc/udev/rules.d/99-umbrel-backup.rules`
    - the mount script at `/usr/local/bin/mount-umbrel-backup.sh`
-   - Python's `requests` module (OTA bumps Python and loses pip-installed packages — re-installed via `apt`)
    - `umbrel` user's membership in the `docker` group (OTA rebuilds `/etc/group` and drops supplementary memberships)
    - executable bits on Guardian's scripts (defense against mode-stripping copies)
    - inotify watch limits in `/etc/sysctl.d/40-inotify-umbrel.conf` (Umbrel 1.7.x consumes more watches than the stock kernel limits allow; without this, `.path` units fail with "inotify watch limit reached")
+
+   The Python venv at `.venv/` lives inside the install dir (persistent partition), so the bot can start instantly on every boot — no apt/pip dance needed. Only if the venv is missing (fresh install) or broken by a Python ABI bump (e.g., 3.13 → 3.14 on a future OTA) does `reinstall-services.sh` re-create it via `python3 -m venv && pip install -r requirements.txt`.
 
 The hook runs with a 5-minute timeout and is designed to never block umbreld from starting even if it fails. No manual intervention needed after an Umbrel OS update.
 

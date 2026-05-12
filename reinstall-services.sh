@@ -39,33 +39,55 @@ source "$CONFIG"
 
 echo "🛡 Umbrel Guardian — Reinstalling systemd services..."
 
-# ── Python dependency check ──────────────────────────────────────────────────
-# Umbrel OS major upgrades bump Python (e.g. 3.11 → 3.13 between 1.5 and 1.7.2),
-# losing pip-installed packages. Reboots on rugpi can also reset /etc and the
-# apt cache, so we run `apt-get update` if the first install attempt fails.
-if ! python3 -c "import requests" &>/dev/null; then
-    echo "  ⚠️  python3 requests module missing — installing..."
-    install_ok=0
-    if apt-get install -y python3-requests &>/dev/null; then
-        install_ok=1
-    else
-        # apt cache may be stale or empty after a reboot — refresh and retry.
-        echo "  ↻  apt-get install failed; refreshing apt lists and retrying..."
-        if apt-get update &>/dev/null && apt-get install -y python3-requests &>/dev/null; then
-            install_ok=1
-        elif python3 -m pip install --quiet --break-system-packages requests &>/dev/null; then
-            install_ok=1
-            echo "  ✅ Installed requests via pip (--break-system-packages)"
+# ── Python virtualenv ────────────────────────────────────────────────────────
+# The bot runs from a venv at $INSTALL_DIR/.venv/. That directory lives in
+# /home (bind-mounted from the persistent data partition), so it survives
+# rugpi A/B reboots and OTAs — no apt/pip dance needed on most boots.
+#
+# We only need to (re)create it when:
+#   - It doesn't exist yet (fresh install)
+#   - It exists but the import test fails (Python version bump invalidated it,
+#     or pip install partially failed previously)
+VENV="$INSTALL_DIR/.venv"
+VENV_PY="$VENV/bin/python3"
+
+ensure_venv() {
+    # Make sure python3-venv is available (Debian splits the stdlib venv module
+    # off; without it, `python3 -m venv` errors with "ensurepip is not available").
+    if ! python3 -c "import venv; venv.EnvBuilder(with_pip=True)" &>/dev/null; then
+        echo "  ⚠️  python3-venv missing — installing..."
+        if ! apt-get install -y python3-venv &>/dev/null; then
+            apt-get update &>/dev/null || true
+            apt-get install -y python3-venv &>/dev/null || {
+                echo "  ❌ Could not install python3-venv. Cannot create venv."
+                return 1
+            }
         fi
     fi
-    if [ "$install_ok" = "1" ]; then
-        # Only print apt-success here so the message reflects which path won
-        python3 -c "import requests" &>/dev/null && \
-            echo "  ✅ Installed python3-requests"
-    else
-        echo "  ❌ Could not install requests. Bot service will fail."
-        echo "     Try manually: sudo apt-get update && sudo apt-get install -y python3-requests"
+
+    echo "  🔧 Creating venv at $VENV..."
+    rm -rf "$VENV"
+    sudo -u umbrel python3 -m venv "$VENV" || return 1
+
+    echo "  📦 Installing requirements into venv..."
+    if ! sudo -u umbrel "$VENV/bin/pip" install --quiet --upgrade pip &>/dev/null; then
+        # Network issue — pip can't reach PyPI. Try again with apt cache refreshed.
+        apt-get update &>/dev/null || true
+        sudo -u umbrel "$VENV/bin/pip" install --quiet --upgrade pip &>/dev/null || true
     fi
+    if sudo -u umbrel "$VENV/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"; then
+        echo "  ✅ Venv ready: $VENV"
+        return 0
+    fi
+    echo "  ❌ pip install -r requirements.txt failed."
+    return 1
+}
+
+if [ ! -x "$VENV_PY" ] || ! "$VENV_PY" -c "import requests" &>/dev/null; then
+    ensure_venv || {
+        echo "  ❌ Could not prepare Python environment. Bot service will fail."
+        echo "     Manual recovery: cd $INSTALL_DIR && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+    }
 fi
 
 # ── Ensure scripts are executable ────────────────────────────────────────────
