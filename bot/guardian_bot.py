@@ -535,17 +535,35 @@ def main():
 
     log.info("Umbrel Guardian bot starting...")
 
-    # Clear any existing webhook and drop pending updates to avoid 409 conflicts
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/deleteWebhook",
-            data={"drop_pending_updates": True},
-            timeout=10
-        )
-        r.raise_for_status()
-        log.info("Webhook cleared, pending updates dropped")
-    except Exception as e:
-        log.warning(f"deleteWebhook failed (non-fatal): {e}")
+    # Wait until the Telegram API is actually reachable before announcing.
+    #
+    # On a reboot/OTA the bot starts within ~15s of boot, often BEFORE DNS is
+    # ready — `api.telegram.org` fails to resolve for a while. The old code
+    # fired deleteWebhook + the "online" broadcast once, eagerly, and silently
+    # dropped both on NameResolutionError. Now we loop on deleteWebhook (which
+    # doubles as the connectivity probe AND the stale-state cleanup it already
+    # performs) until it succeeds, then announce.
+    #
+    # HTTP errors (401/404) mean a bad token or a Telegram-side problem —
+    # those are fatal, not transient, so we exit rather than loop forever.
+    _wait = _BACKOFF_INITIAL
+    while True:
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{token}/deleteWebhook",
+                data={"drop_pending_updates": True},
+                timeout=10
+            )
+            r.raise_for_status()
+            log.info("Webhook cleared, pending updates dropped — Telegram reachable")
+            break
+        except requests.exceptions.HTTPError as e:
+            log.error(f"Telegram API rejected request ({e}). Check BOT_TOKEN — exiting.")
+            sys.exit(1)
+        except Exception as e:
+            log.warning(f"Telegram not reachable yet ({e.__class__.__name__}); retrying in {_wait}s")
+            time.sleep(_wait)
+            _wait = min(_wait * 2, _BACKOFF_MAX)
 
     broadcast(token, chat_ids, "🛡 Umbrel Guardian is online. Send /help for commands.")
 
