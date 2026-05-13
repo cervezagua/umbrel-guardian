@@ -327,10 +327,14 @@ else
     ok "Running from install directory — skipping copy"
 fi
 
+# `cp -r` (no -p) drops the executable bit, so re-add it on the scripts.
+# (When SOURCE_DIR == INSTALL_DIR the git checkout already has the right modes,
+#  but this is harmless and covers the copied case + clones that lost +x.)
 chmod +x "$INSTALL_DIR/scripts/"*.sh
 chmod +x "$INSTALL_DIR/custom-hooks/pre-start"
 chmod +x "$INSTALL_DIR/reinstall-services.sh"
 chmod +x "$INSTALL_DIR/uninstall.sh"
+chmod +x "$INSTALL_DIR/install.sh"
 
 # ─ Write config ──────────────────────────────────────────────────────────────
 CONFIG="$INSTALL_DIR/config.env"
@@ -353,8 +357,16 @@ INSTALL_DIR=${INSTALL_DIR}
 LOCK_PIN=${LOCK_PIN}
 EOF
 
-chmod 600 "$CONFIG"               # protect token from other users
-chmod -R 750 "$INSTALL_DIR"       # owner rwx, group rx, others none
+# Permissions:
+#   - top-level dir 750 (others can't even list it)
+#   - config.env 600 (it holds the bot token — owner-only)
+# We deliberately do NOT `chmod -R 750`: that would set +x on every regular
+# file (README, services/*, etc.) — causing git mode-diff churn on the Pi's
+# checkout — AND clobber config.env's 600, AND risk altering .venv/ binaries.
+# The git checkout (or the explicit `chmod +x` lines above) already give the
+# scripts the right modes.
+chmod 750 "$INSTALL_DIR"
+chmod 600 "$CONFIG"
 chown -R umbrel:umbrel "$INSTALL_DIR"  # service runs as umbrel — must own all files
 ok "Config written to $CONFIG"
 
