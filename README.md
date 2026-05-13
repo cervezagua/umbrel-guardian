@@ -13,7 +13,7 @@ Runs directly on the host — no Umbrel app store required, no modifications to 
 | 🚨 **Health Alerts** | Proactive notifications for high disk usage & unhealthy apps |
 | 💾 **Automated Backups** | Daily rsync to an external drive with rotation and Telegram notifications |
 | 📊 **Daily Summary** | Morning status report delivered to Telegram at 09:00 |
-| 🔄 **OTA-Resilient** | Survives Umbrel OS updates via the official pre-start hook |
+| 🔄 **Self-healing across reboots & OTAs** | Re-installs itself on every boot via Umbrel's pre-start hook — survives reboots and OS updates on the SD-card-boot + SSD-data layout |
 | 🔌 **Backup Drive Auto-Mount** | udev hot-plug + boot service — mount backup drive automatically |
 | 🔐 **Access Control** | Authorized users list + safe mode with PIN lock |
 | 🛡 **Security Hardened** | Rate limiting, input validation, sandboxed systemd services |
@@ -38,16 +38,16 @@ cd umbrel-guardian
 sudo bash install.sh
 ```
 
-The interactive installer walks you through **8 steps**:
+If a previous `config.env` exists, the installer asks before overwriting it — for routine updates use `reinstall-services.sh` instead (see [Update](#-update)), which keeps your config. The interactive installer then walks you through **8 steps**:
 
 1. 🔍 Auto-detect Umbrel directory
 2. ⚙️ System prerequisites (Docker group, `python3-venv`)
 3. 🐍 Python prerequisites (a venv is created inside the install dir in step 8)
 4. 📱 Telegram bot token + chat ID + optional safe mode PIN
-5. 💾 Backup drive selection (numbered menu with auto-detection)
+5. 💾 Backup drive (auto-detected; if none is connected you can plug one in and re-scan, or explicitly skip — and you're reminded at the end if backups end up unconfigured)
 6. 🩺 Health monitoring interval
-7. 📦 Copy files to persistent install directory
-8. 🔧 Install & enable systemd services + deploy OTA-recovery hook + build venv with `pip install -r requirements.txt`
+7. 📦 Copy files to the persistent install directory
+8. 🔧 Install & enable systemd services + deploy the recovery hook (both layers) + build the venv via `pip install -r requirements.txt`
 
 ---
 
@@ -351,35 +351,60 @@ sudo bash /home/umbrel/umbrel/umbrel-guardian/reinstall-services.sh
 
 ---
 
-## 🔄 OTA Update Resilience
+## 🔄 Surviving Reboots & OTA Updates
 
-Umbrel OS uses A/B root partitions. OTA updates wipe `/etc/systemd/system/`, `/usr/local/bin/`, and `/etc/udev/rules.d/` — Guardian's units, mount script, and udev rule all disappear.
+**Short version:** Guardian re-installs itself automatically on every boot. You can reboot the Pi or take an Umbrel OS update and the bot, timers, backup machinery, and system-command sudoers all come back on their own within ~30–60 seconds — no manual `reinstall-services.sh` needed.
 
-Guardian survives this through Umbrel's **official pre-start hook**, introduced in 1.7.x:
+### Why this needs special handling
 
-1. 📂 Install directory lives under `/home/umbrel/umbrel/` (bind-mounted from the persistent data partition — survives OTA).
-2. 🪝 A small recovery script at `/home/umbrel/umbrel/custom-hooks/pre-start` is invoked on every boot by Umbrel's `umbrel-custom-pre-start.service` (wrapper at `/opt/umbrel-custom-hooks/run-pre-start`).
-3. 🔧 The hook detects when Guardian's units are missing and runs `reinstall-services.sh`, which restores everything that an OTA wipes:
-   - all `umbrel-guardian-*` systemd units in `/etc/systemd/system/`
-   - the udev rule at `/etc/udev/rules.d/99-umbrel-backup.rules`
-   - the mount script at `/usr/local/bin/mount-umbrel-backup.sh`
-   - `umbrel` user's membership in the `docker` group (OTA rebuilds `/etc/group` and drops supplementary memberships)
-   - executable bits on Guardian's scripts (defense against mode-stripping copies)
-   - inotify watch limits in `/etc/sysctl.d/40-inotify-umbrel.conf` (Umbrel 1.7.x consumes more watches than the stock kernel limits allow; without this, `.path` units fail with "inotify watch limit reached")
+Modern Umbrel (1.7.x) on a Raspberry Pi runs on a [rugpi](https://oss.silitics.com/rugpi/) A/B layout where the root filesystem is an **overlay**: a read-only base image plus a writable layer that is **reset to the base image on every boot**. That means anything Guardian writes outside `/home` — its systemd units in `/etc/systemd/system/`, the udev rule in `/etc/udev/rules.d/`, the mount script in `/usr/local/bin/`, the sudoers file in `/etc/sudoers.d/`, the `umbrel` user's `docker` group membership in `/etc/group`, sysctl tweaks in `/etc/sysctl.d/` — is gone after a plain reboot, not just after an OTA. (`/opt` resets too, so Guardian can't permanently patch anything Umbrel ships there either.)
 
-   The Python venv at `.venv/` lives inside the install dir (persistent partition), so the bot can start instantly on every boot — no apt/pip dance needed. Only if the venv is missing (fresh install) or broken by a Python ABI bump (e.g., 3.13 → 3.14 on a future OTA) does `reinstall-services.sh` re-create it via `python3 -m venv && pip install -r requirements.txt`.
+### What persists
 
-The hook runs with a 5-minute timeout and is designed to never block umbreld from starting even if it fails. No manual intervention needed after an Umbrel OS update.
+Only two places survive:
 
-**Trigger recovery manually (for testing or forced re-install):**
+- `/home` — on the SD card partition (`mmcblk0p7` on a Pi 5).
+- `/home/umbrel/umbrel/` — on the external data drive (the SSD), bind-mounted on top of `/home/umbrel/umbrel/` by `umbrel-external-storage.service` at boot. This is the **SD-card-for-boot + SSD-for-data** layout that Umbrel uses on Pi.
+
+Guardian's entire install directory — scripts, services, the `.venv/` with `requests` pre-installed, and the recovery hook — lives at `/home/umbrel/umbrel/umbrel-guardian/`, on the SSD. So it survives. The job at boot is just to re-stamp the `/etc` and `/usr` bits from there.
+
+### The recovery chain
+
+1. **Umbrel's pre-start hook fires.** `umbrel-custom-pre-start.service` runs `/opt/umbrel-custom-hooks/run-pre-start` early in boot (after local filesystems + network, before `umbreld`), with a 5-minute budget. That wrapper looks for `/home/umbrel/umbrel/custom-hooks/pre-start` and runs it if present.
+2. **Guardian's hook runs.** It polls until the SSD is mounted (detected by `config.env` appearing under the install dir), then — if Guardian's systemd units are missing — runs `reinstall-services.sh`.
+3. **`reinstall-services.sh` re-stamps everything an overlay reset wiped:**
+   - all `umbrel-guardian-*` systemd units in `/etc/systemd/system/` (with the configured timer schedules patched in)
+   - the udev rule `/etc/udev/rules.d/99-umbrel-backup.rules` and the mount script `/usr/local/bin/mount-umbrel-backup.sh` (only when auto-mount is enabled)
+   - `umbrel`'s membership in the `docker` group (so the bot can run `docker ps` / `docker compose logs`)
+   - executable bits on all Guardian scripts (defence against mode-stripping copies)
+   - inotify watch limits via `/etc/sysctl.d/40-inotify-umbrel.conf` (1.7.x exhausts the stock limits, which makes `.path` units fail with "inotify watch limit reached")
+   - the `/etc/sudoers.d/umbrel-guardian-system` file that lets `/system_reboot`, `/system_shutdown`, `/restart_docker`, `/restart_umbrel` work
+   - both copies of the pre-start hook (see next section)
+4. **The bot starts** from `.venv/bin/python3` — instantly, because the venv lived on the SSD and survived. No `apt`, no `pip` on a normal boot. Only if the venv is missing (first install) or invalidated by a Python ABI bump on some future OTA does `reinstall-services.sh` rebuild it (`python3 -m venv && pip install -r requirements.txt`).
+5. **The bot waits for Telegram to be reachable** before sending its "🛡 Umbrel Guardian is online" message — boot-time DNS often isn't ready in the first 10–20 seconds, so the bot retries the connectivity probe with backoff and announces only once it's actually online.
+
+### The SD-card + SSD timing wrinkle (and how it's handled)
+
+There's a subtle ordering trap on the SD-card-boot + SSD-data layout. `umbrel-custom-pre-start.service` and `umbrel-external-storage.service` are **both** ordered `After=local-fs.target` and `Before=umbrel.service`, but **neither orders against the other** — so they run in parallel. In practice the pre-start hook fires *a few seconds before* the SSD finishes mounting onto `/home/umbrel/umbrel/`. At that instant, `/home/umbrel/umbrel/` is still the empty mount-point directory on the SD card — and Guardian's hook (which lives on the SSD) isn't visible yet. Umbrel's wrapper sees nothing there and exits silently.
+
+Guardian works around this by deploying the hook to **two places**:
+
+- `/home/umbrel/umbrel/custom-hooks/pre-start` — on the SSD (the path you'd see during normal operation, used for manual invocation and on systems with no external storage).
+- The *same path on the SD-card layer underneath the overlay* — i.e. `mmcblk0p7:/state/default/persist/data/umbrel-os/home/umbrel/umbrel/custom-hooks/pre-start`, written by temporarily mounting the SD partition during `reinstall-services.sh`.
+
+At early boot the wrapper finds the **SD-card copy** (because the SSD hasn't mounted yet), runs it, and the hook patiently polls for the SSD to come up before doing its work. On a system without external storage — where `/home/umbrel/umbrel/` is just a normal directory — the device check sees one filesystem, skips the SD-card step, and the single SSD-path copy is all that's needed.
+
+### Manual recovery
+
+You almost never need this, but if you want to force it (testing, or after a manual mess):
 
 ```bash
-sudo /opt/umbrel-custom-hooks/run-pre-start    # idempotent — no-op if units exist
-# or
+sudo /opt/umbrel-custom-hooks/run-pre-start    # idempotent — no-op if units already present
+# or, directly:
 sudo bash /home/umbrel/umbrel/umbrel-guardian/reinstall-services.sh
 ```
 
-> **Note:** Earlier versions of Guardian used an `umbrel-guardian-bootstrap.service` for this. That pattern failed on Umbrel 1.7.x because the bootstrap unit itself lived in `/etc/systemd/system/` and got wiped along with everything else. `reinstall-services.sh` now removes any stale bootstrap unit it finds.
+> **Historical note:** Older Guardian releases used an `umbrel-guardian-bootstrap.service` for this. That pattern broke on Umbrel 1.7.x because the bootstrap unit *itself* lived in `/etc/systemd/system/` and got wiped with everything else on each boot. `reinstall-services.sh` removes any stale bootstrap unit it finds.
 
 ---
 

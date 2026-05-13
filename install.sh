@@ -27,9 +27,43 @@ ok()   { echo "  ✅ $*"; }
 warn() { echo "  ⚠️  $*"; }
 err()  { echo "  ❌ $*" >&2; exit 1; }
 
+# Non-system partitions that could serve as backup targets.
+# Excludes: SD card (mmcblk*), zram, loop, the boot/rugpi partitions, and the
+# Umbrel data partition. $NF=="part" guards against lsblk column-collapse when
+# columns like MOUNTPOINT are empty.
+scan_backup_drives() {
+    lsblk -lnpo NAME,SIZE,LABEL,MOUNTPOINT,TYPE 2>/dev/null \
+        | awk '$NF=="part"' \
+        | grep -v 'mmcblk\|loop\|zram' \
+        | grep -v '/mnt/root/mnt/data\|/mnt/data' \
+        | grep -v '/run/rugpi\|/boot'
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 print_header
+
+# ─ Guard against clobbering an existing config ───────────────────────────────
+# install.sh always writes a fresh config.env. If one already exists, re-running
+# this script overwrites it (bot token, backup settings, everything). For routine
+# updates the user should use reinstall-services.sh, which preserves config.env.
+if [ -f "$INSTALL_DIR/config.env" ]; then
+    echo "  ⚠️  An existing configuration was found:"
+    echo "       $INSTALL_DIR/config.env"
+    echo
+    echo "  Re-running install.sh starts a FRESH setup and OVERWRITES it — you'll"
+    echo "  re-enter the bot token, re-select the backup drive, and so on."
+    echo
+    echo "  To just update Guardian to the latest code (keeping your config), cancel"
+    echo "  this and run instead:"
+    echo "       sudo bash $INSTALL_DIR/reinstall-services.sh"
+    echo
+    read -rp "  Continue with a fresh install and overwrite config.env? [y/N]: " _OVERWRITE
+    case "${_OVERWRITE,,}" in
+        y|yes) echo ;;
+        *)     echo "  Aborted. Use reinstall-services.sh to update without losing your config."; exit 0 ;;
+    esac
+fi
 
 # ─ Detect Umbrel ─────────────────────────────────────────────────────────────
 step 1 "Detect Umbrel"
@@ -112,23 +146,38 @@ BACKUP_TIME="02:00"
 BACKUP_PATH=""
 AUTO_MOUNT="n"
 
-# Build a list of non-system partitions that could be backup targets.
-# Excludes: SD card (mmcblk*), zram, loop, and the Umbrel data partition.
-# Uses $NF=="part" because lsblk collapses empty columns (e.g. no MOUNTPOINT
-# shifts TYPE from field 5 to field 4).
-mapfile -t BACKUP_CANDIDATES < <(
-    lsblk -lnpo NAME,SIZE,LABEL,MOUNTPOINT,TYPE 2>/dev/null \
-        | awk '$NF=="part"' \
-        | grep -v 'mmcblk\|loop\|zram' \
-        | grep -v '/mnt/root/mnt/data\|/mnt/data' \
-        | grep -v '/run/rugpi\|/boot'
-)
+mapfile -t BACKUP_CANDIDATES < <(scan_backup_drives)
 
-if [ "${#BACKUP_CANDIDATES[@]}" -eq 0 ]; then
-    warn "No backup drive detected."
-    echo "     Plug in a USB/external drive and re-run install.sh to enable backups."
+# If nothing was found, don't silently sail past — give the user a chance to
+# plug a drive in and re-scan, or to explicitly opt out. (Silently continuing
+# was the old behaviour and it made it easy to end up with no backups at all
+# without realising it.)
+while [ "${#BACKUP_CANDIDATES[@]}" -eq 0 ]; do
     echo
-else
+    warn "No external backup drive detected."
+    echo
+    echo "  Umbrel Guardian's automated backups need a USB or SATA drive."
+    echo "  Without one, the backup feature will NOT be configured."
+    echo
+    echo "    1) I'll plug in the backup drive now — re-scan"
+    echo "    2) Continue WITHOUT backups (re-run install.sh later to add one)"
+    echo
+    read -rp "  Choice [1]: " _NO_DRIVE
+    case "${_NO_DRIVE:-1}" in
+        2)
+            warn "Continuing without backups."
+            echo "     Re-run install.sh once a backup drive is connected to enable them."
+            break
+            ;;
+        *)
+            echo "  Re-scanning for drives..."
+            sleep 2
+            mapfile -t BACKUP_CANDIDATES < <(scan_backup_drives)
+            ;;
+    esac
+done
+
+if [ "${#BACKUP_CANDIDATES[@]}" -gt 0 ]; then
     echo "  Detected backup-capable drives:"
     echo
     idx=1
@@ -147,12 +196,14 @@ else
         CANDIDATE_NAMES+=("$cand_dev")
         idx=$((idx + 1))
     done
-    echo "    ${idx}) Skip backups"
+    echo "    ${idx}) Skip backups (configure later)"
     echo
     read -rp "  Select drive [${idx}]: " DRIVE_CHOICE
     DRIVE_CHOICE="${DRIVE_CHOICE:-$idx}"
 
-    if [ "$DRIVE_CHOICE" -lt "$idx" ] 2>/dev/null && [ "$DRIVE_CHOICE" -ge 1 ]; then
+    if [ "$DRIVE_CHOICE" = "$idx" ]; then
+        warn "Skipping backup setup. Re-run install.sh later to enable backups."
+    elif [ "$DRIVE_CHOICE" -lt "$idx" ] 2>/dev/null && [ "$DRIVE_CHOICE" -ge 1 ]; then
         sel_idx=$((DRIVE_CHOICE - 1))
         sel_mount="${CANDIDATE_PATHS[$sel_idx]}"
         sel_dev="${CANDIDATE_NAMES[$sel_idx]}"
@@ -335,3 +386,15 @@ echo
 echo "  Logs:            journalctl -u umbrel-guardian-bot -f"
 echo "  Uninstall:       ./uninstall.sh"
 echo
+
+if [ -z "$BACKUP_PATH" ]; then
+    echo "  ┌────────────────────────────────────────────────────────┐"
+    echo "  │  ⚠️   BACKUPS ARE NOT CONFIGURED                         │"
+    echo "  └────────────────────────────────────────────────────────┘"
+    echo "  No backup drive was selected, so Guardian is NOT backing up"
+    echo "  your apps or data. To enable backups later:"
+    echo "    1. Plug in a USB or SATA drive"
+    echo "    2. cd $INSTALL_DIR && sudo bash install.sh"
+    echo "       (re-run the installer; it'll detect the drive this time)"
+    echo
+fi
