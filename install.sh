@@ -323,7 +323,7 @@ ok "Services enabled and started"
 # ─ Done ──────────────────────────────────────────────────────────────────────
 echo
 echo "╔══════════════════════════════════════════╗"
-echo "║  ✅ Umbrel Guardian installed!            ║"
+echo "║  ✅ Umbrel Guardian installed!           ║"
 echo "╚══════════════════════════════════════════╝"
 echo
 echo "  Telegram bot:    systemctl status umbrel-guardian-bot"
