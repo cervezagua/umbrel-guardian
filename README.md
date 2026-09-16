@@ -184,8 +184,16 @@ kill -HUP $(systemctl show -p MainPID umbrel-guardian-bot | cut -d= -f2)
 
 | Scope | What's backed up | Size |
 |---|---|---|
-| `essential` | `app-data/`, `db/`, `secrets/` | A few GB — fast |
+| `essential` | `app-data/`, `db/`, `secrets/`, `umbrel.yaml`, `members/` | A few GB — fast |
 | `full` | Entire `UMBREL_DIR` via `rsync --delete` | 500 GB+ if Bitcoin installed — slow |
+
+`umbrel.yaml` is umbreld's store: the installed-app list, your account and its password hash, member accounts, and your wifi/hostname/static-IP settings. An essential snapshot without it restores app data that nothing knows how to launch, on a node with no user account — so it is always included.
+
+`home/` (your Files and Photos) is **not** in essential scope by default. It can be tens of GB, and essential keeps `BACKUP_KEEP` dated copies. Set `BACKUP_ESSENTIAL_INCLUDE_HOME=y` to include it. The full clone always covers it.
+
+**What the full clone leaves out.** umbrelOS mounts external USB drives at `external/<Label>`, network shares at `network/`, and its own backup repo at `backups/` — all *inside* the directory being backed up. Those three are always excluded: without that, a backup drive that umbrelOS auto-mounted would be copied into itself until the drive filled. Regenerable caches (`app-stores/`, `thumbnails/`, `file-index/`, `kopia/`, `lan-ingress/` and similar) are also skipped, mirroring what umbrelOS omits from its own backups; set `BACKUP_EXCLUDE_CHURN=n` for a byte-for-byte clone.
+
+> **Upgrading an existing full clone:** the first run after adding these excludes uses `rsync --delete-excluded`, which removes previously-mirrored copies of the now-excluded paths from the backup drive. It never touches your source data.
 
 ### Rotation
 
@@ -204,6 +212,8 @@ The `/backup` bot command touches a trigger file. A systemd `.path` unit watches
 - ⚡ **ionice/nice** keeps the Pi responsive during rsync
 - 🧪 **Atomic snapshots (essential)** — rsync writes to `.tmp`, renamed on success only
 - 🏷 **Completion marker (full)** — an `.incomplete` file flags a mirror that is mid-update
+- 🚧 **Mount excludes** — `external/`, `network/` and `backups/` are never copied, so an auto-mounted drive can't be backed up into itself
+- 🗄 **Consistent database snapshot** — `umbrel.db` is captured via `sqlite3 .backup` rather than copied live (umbrelOS 2.0+)
 - 📏 **Pre-flight capacity check** — a drive too small for a full clone fails in seconds, not hours in
 - 📡 **Telegram notifications** on success and failure (naming the first real rsync error, not just the tail)
 - 🔌 **mountpoint check** — refuses to run if backup drive isn't mounted

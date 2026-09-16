@@ -60,6 +60,12 @@ fi
 
 # The destination must not live inside the source. rsync would copy the backup
 # into itself, recursing until the drive fills and the receiver dies mid-write.
+#
+# This only catches BACKUP_PATH being configured inside UMBREL_DIR. It cannot
+# see the same physical drive mounted a second time at a path inside the source
+# — which is exactly what umbrelOS does, mounting external drives under
+# UMBREL_DIR/external/. That case is handled by the mount excludes further down,
+# not here.
 case "${DEST_BASE%/}/" in
     "${UMBREL_SRC%/}"/*)
         "$SEND" "⚠️ Backup skipped: BACKUP_PATH ($DEST_BASE) is inside UMBREL_DIR ($UMBREL_SRC).
@@ -100,14 +106,41 @@ case "$SCOPE" in
         FULL_CLONE=true
         ;;
     *)
-        # Essential: the three directories needed to restore apps and their settings.
+        # Essential: what is actually needed to restore apps and their settings.
         # Fast, small, sufficient for the vast majority of recovery scenarios.
+        #
+        # umbrel.yaml is not optional despite its size. It is umbreld's store
+        # (dataDirectory/umbrel.yaml) and holds the installed-app list, the owner
+        # account with its password hash and TOTP secret, member accounts, widgets,
+        # shortcuts and the wifi/hostname/static-IP settings. Without it a restore
+        # comes back up as a node that believes no apps are installed and has no
+        # user account — app-data on disk that nothing knows how to launch.
+        #
+        # db/ survives despite now holding almost nothing: db/umbrel-seed/seed is
+        # what every app's passwords are derived from.
+        #
+        # Paths are existence-tested rather than hardcoded so one code path stays
+        # correct across umbrelOS versions (members/ is 2.0-only, and rsync fails
+        # the whole run on a missing source argument).
         FULL_CLONE=false
-        SOURCES=(
-            "$UMBREL_SRC/app-data"
-            "$UMBREL_SRC/db"
-            "$UMBREL_SRC/secrets"
-        )
+        SOURCES=()
+        for CANDIDATE in app-data db secrets umbrel.yaml members; do
+            [ -e "$UMBREL_SRC/$CANDIDATE" ] && SOURCES+=("$UMBREL_SRC/$CANDIDATE")
+        done
+
+        # home/ is the owner's Files and Photos data. Off by default: it can be
+        # tens of GB, and essential keeps BACKUP_KEEP dated snapshots, so silently
+        # including it would multiply both the runtime and the space this scope
+        # was chosen to avoid. The full clone always covers it.
+        if [ "${BACKUP_ESSENTIAL_INCLUDE_HOME:-n}" = "y" ] && [ -d "$UMBREL_SRC/home" ]; then
+            SOURCES+=("$UMBREL_SRC/home")
+        fi
+
+        if [ "${#SOURCES[@]}" -eq 0 ]; then
+            "$SEND" "⚠️ Backup skipped: none of the expected Umbrel data directories
+exist under $UMBREL_SRC. Is UMBREL_DIR set correctly in config.env?"
+            exit 1
+        fi
         ;;
 esac
 
@@ -139,6 +172,77 @@ RESUMED=false
 # --stats gives us the bytes actually transferred for the completion message.
 RSYNC_OPTS=( -a --timeout="$RSYNC_TIMEOUT" --stats )
 
+# ── Full-clone excludes ─────────────────────────────────────────────────────
+# Every pattern here is anchored with a leading slash so it matches only at the
+# top of the transfer root. Without the anchor, "external" would also match an
+# app's own app-data/<app>/external directory.
+
+# MOUNT POINTS — not configurable, because this is a correctness property.
+#
+# umbrelOS mounts things *inside* the directory we are backing up:
+#   external/<Label>  every external USB drive (files.ts: '/External')
+#   network/          mounted NAS/SMB shares   (files.ts: '/Network')
+#   backups/          umbrelOS's own backup repo mount
+#
+# The external auto-mount is not gated on Raspberry Pi — the "not supported on
+# Pi" screen in the UI only covers choosing an external drive as a *backup
+# destination*. Files mounts any USB partition that is not already mounted, and
+# it decides that by checking whether the partition has a mountpoint already.
+# Guardian's own udev rule usually wins that race, which is the only reason the
+# backup drive normally lands outside the source tree. umbrelOS mounts on a
+# D-Bus device event with no polling and no retry, so the race is not ours to
+# rely on: if it ever wins, the backup drive appears at external/<Label> and a
+# full clone copies the backup into itself until the drive fills. That fails as
+# "write error: Broken pipe ... error in socket IO (code 10)" hours in — the
+# receiver dying of ENOSPC, with nothing in the message naming the real cause.
+#
+# Backing up other people's drives and NAS shares would be wrong even if it were
+# safe, so these stay excluded regardless.
+RSYNC_EXCLUDES=(
+    --exclude=/external/
+    --exclude=/network/
+    --exclude=/backups/
+)
+
+# CHURN — mirrors umbrelOS's own .kopiaignore. Everything here is either a
+# regenerable cache, an incomplete staging copy, or per-device material that a
+# restore recreates anyway; copying it burns USB write cycles and backup window
+# for data that would be discarded on restore. Upstream additionally notes that
+# machines/*/media can contain password hashes and Windows product keys.
+if [ "${BACKUP_EXCLUDE_CHURN:-y}" = "y" ]; then
+    RSYNC_EXCLUDES+=(
+        --exclude=/app-stores/
+        --exclude=/thumbnails/
+        --exclude=/file-index/
+        --exclude=/kopia/
+        --exclude=/.temporary-migration/
+        --exclude=/app-data/*/.data-moving-*
+        --exclude=/machine-images/
+        --exclude=/machines/*/operations
+        --exclude=/machines/*/media
+        --exclude=/lan-ingress/
+    )
+fi
+
+# umbrel.db is umbreld's SQLite database, introduced after 1.7.x. A live copy of
+# the database alongside its -wal and -shm is not a consistent snapshot: upstream
+# excludes exactly these from its own backups because "SQLite's database, WAL,
+# and shared-memory files cannot be copied independently while writes and
+# checkpoints continue". We exclude them from the transfer and write a proper
+# snapshot afterwards instead. On a version that has no umbrel.db this block is
+# skipped entirely and nothing changes.
+UMBREL_DB="$UMBREL_SRC/umbrel.db"
+SNAPSHOT_DB=false
+if [ "$FULL_CLONE" = true ] && [ -f "$UMBREL_DB" ]; then
+    SNAPSHOT_DB=true
+    RSYNC_EXCLUDES+=(
+        --exclude=/umbrel.db
+        --exclude=/umbrel.db-wal
+        --exclude=/umbrel.db-shm
+        --exclude=/umbrel.db-journal
+    )
+fi
+
 if [ "$FULL_CLONE" = true ]; then
     # Rolling mirror, written in place — no .tmp staging.
     #
@@ -159,8 +263,14 @@ if [ "$FULL_CLONE" = true ]; then
     [ -f "$MARKER" ] && RESUMED=true
     : > "$MARKER"
 
+    # --delete-excluded, not just --delete. rsync protects excluded paths that
+    # already exist on the destination, so without it a mirror made before these
+    # excludes existed would keep its copy of external/, app-stores/ and kopia/
+    # forever — stale data that a future restore would trust. This only ever
+    # deletes from the backup drive; the source is opened read-only.
     ionice -c2 -n7 nice -n 10 \
-        rsync "${RSYNC_OPTS[@]}" --delete-during "$UMBREL_SRC/" "$DEST/" >"$RSYNC_LOG" 2>&1 || RSYNC_EXIT=$?
+        rsync "${RSYNC_OPTS[@]}" "${RSYNC_EXCLUDES[@]}" --delete-during --delete-excluded \
+            "$UMBREL_SRC/" "$DEST/" >"$RSYNC_LOG" 2>&1 || RSYNC_EXIT=$?
 else
     # Essential — stage in a .tmp subdirectory; rename on success.
     # Snapshots are small and date-stamped, so discarding a failed one and
@@ -192,6 +302,31 @@ case "$RSYNC_EXIT" in
         RSYNC_EXIT=0
         ;;
 esac
+
+# ── Consistent umbrel.db snapshot ───────────────────────────────────────────
+# Runs only when rsync succeeded, and before the .incomplete marker is cleared,
+# so a mirror is never advertised as restorable with a missing or torn database.
+# sqlite3's .backup uses the online backup API: it takes the same locks the
+# database itself uses and produces a file that is consistent even though
+# umbreld is still writing.
+DB_WARN=""
+if [ "$SNAPSHOT_DB" = true ] && [ "$RSYNC_EXIT" -eq 0 ]; then
+    if command -v sqlite3 &>/dev/null &&
+       sqlite3 "$UMBREL_DB" ".backup '$DEST/umbrel.db'" 2>>"$RSYNC_LOG"; then
+        # Stale -wal/-shm beside a fresh snapshot would be read on restore and
+        # could roll the database back to the previous state.
+        rm -f "$DEST/umbrel.db-wal" "$DEST/umbrel.db-shm" "$DEST/umbrel.db-journal"
+    else
+        # Better a torn copy than no database at all — without it the restore has
+        # nothing to promote. Say so plainly rather than failing the whole run.
+        cp -f "$UMBREL_DB" "$DEST/umbrel.db" 2>>"$RSYNC_LOG" || true
+        if command -v sqlite3 &>/dev/null; then
+            DB_WARN="⚠️ umbrel.db snapshot failed — copied live instead, may be inconsistent"
+        else
+            DB_WARN="⚠️ sqlite3 not installed — umbrel.db copied live, may be inconsistent"
+        fi
+    fi
+fi
 
 # ── Promote or clean up staged data ─────────────────────────────────────────
 if [ "$FULL_CLONE" = true ]; then
@@ -306,6 +441,11 @@ fi
 if [ -n "$RSYNC_WARN" ]; then
     MSG="$MSG
 $RSYNC_WARN"
+fi
+
+if [ -n "$DB_WARN" ]; then
+    MSG="$MSG
+$DB_WARN"
 fi
 
 "$SEND" "$MSG"
