@@ -163,6 +163,7 @@ UMBREL_DIR=/home/umbrel/umbrel
 BACKUP_PATH=/mnt/root/mnt/umbrel-backup  # rugpi: /mnt/root/mnt/... — non-rugpi: /mnt/...
 BACKUP_SCOPE=essential    # essential (app-data + db + secrets) | full (entire Umbrel dir)
 BACKUP_KEEP=3             # number of essential snapshots to retain
+# BACKUP_SKIP_SPACE_CHECK=y  # run a full clone even if the drive looks too small
 BACKUP_TIME=02:00         # daily backup time (24h, UTC)
 AUTO_MOUNT=y              # auto-mount backup drive by label (udev hot-plug + boot)
 DISK_THRESHOLD=90         # alert when disk exceeds this %
@@ -189,7 +190,9 @@ kill -HUP $(systemctl show -p MainPID umbrel-guardian-bot | cut -d= -f2)
 ### Rotation
 
 - **Essential** backups are date-stamped (`umbrel-backup-2026-03-07_0200/`). Old ones are pruned to keep the last `BACKUP_KEEP` copies.
-- **Full** clone is a rolling mirror — always one copy, always current.
+- **Full** clone is a rolling mirror — always one copy, always current. It is updated in place, so the drive only needs to hold one copy and each run transfers just what changed since the last one.
+
+While a full-clone run is in progress a marker file `umbrel-full-clone.incomplete` sits next to the mirror, and is removed when the run completes. If you ever find it there, the mirror is mid-update or the last run failed partway — don't restore from it until a run finishes. The partial mirror is deliberately kept so the next run resumes from it rather than starting over.
 
 ### Manual Trigger
 
@@ -199,9 +202,12 @@ The `/backup` bot command touches a trigger file. A systemd `.path` unit watches
 
 - 🔒 **flock** prevents concurrent backup runs
 - ⚡ **ionice/nice** keeps the Pi responsive during rsync
-- 🧪 **Atomic staging** — rsync writes to `.tmp`, renamed on success only
-- 📡 **Telegram notifications** on success and failure (with rsync error output)
+- 🧪 **Atomic snapshots (essential)** — rsync writes to `.tmp`, renamed on success only
+- 🏷 **Completion marker (full)** — an `.incomplete` file flags a mirror that is mid-update
+- 📏 **Pre-flight capacity check** — a drive too small for a full clone fails in seconds, not hours in
+- 📡 **Telegram notifications** on success and failure (naming the first real rsync error, not just the tail)
 - 🔌 **mountpoint check** — refuses to run if backup drive isn't mounted
+- 🚫 **recursion guard** — refuses to run if `BACKUP_PATH` is inside `UMBREL_DIR`
 - 🔧 **mount safety net** — `backup.sh` calls the mount script before starting, ensuring the drive is mounted even if udev missed it
 
 ---
@@ -228,9 +234,14 @@ ls /mnt/restore/                        # confirm backup contents are visible
 
 **Full clone:**
 ```bash
+# Confirm the mirror is complete — this must print nothing:
+ls /mnt/restore/umbrel-full-clone.incomplete 2>/dev/null
+
 sudo rsync -a --delete /mnt/restore/umbrel-full-clone/ /home/umbrel/umbrel/
 sudo chown -R umbrel:umbrel /home/umbrel/umbrel/
 ```
+
+If `umbrel-full-clone.incomplete` exists, the last backup run did not finish and the mirror is in an inconsistent state. Re-run the backup to completion before restoring from it.
 
 **Essential (use the most recent snapshot):**
 ```bash
