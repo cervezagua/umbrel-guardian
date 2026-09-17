@@ -245,7 +245,12 @@ if [[ "${LAST_EPOCH:-}" =~ ^[0-9]+$ ]]; then
         echo "⏱ Last backup: ${AGE_H}h ago"
     fi
 else
-    echo "⏱ Last backup: unknown (no completed run recorded on this boot)"
+    # Reaching here means neither the stamp nor systemd knows. Say which, so
+    # the next step is obvious rather than a mystery.
+    echo "⏱ Last backup: unknown — no stamp on the drive and no record from systemd."
+    echo "   A backup written by this version of Guardian leaves a stamp; an older"
+    echo "   one, or a mirror copied from elsewhere, will not have one until the"
+    echo "   next run completes."
 fi
 
 # A read-only remount is how a failing drive presents itself: everything looks

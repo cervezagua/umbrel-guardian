@@ -317,6 +317,24 @@ else
     rm -rf "$DEST_TMP"
 fi
 
+# ── Record that a backup completed ───────────────────────────────────────────
+# verify_backup.sh reads this to answer "how old is the backup", and without it
+# falls back to the systemd unit's ExecMainExitTimestamp — which knows nothing
+# about a run started by hand, and reports "unknown" one minute after a backup
+# finished. An answer that says "I cannot tell" when it plainly could is worse
+# than no line at all: it is the one number you check before trusting a restore.
+#
+# On the destination, not in .state/: it describes the mirror, so it belongs
+# beside the mirror. A drive moved to another machine carries its own age with
+# it, and a rebuilt node with an empty .state/ still learns when this backup
+# was taken.
+#
+# Written only on success. A stamp refreshed by a failed run would age-out the
+# real answer and make a stale mirror look current.
+if [ "$RSYNC_EXIT" -eq 0 ]; then
+    : > "$DEST_BASE/.umbrel-guardian-last-backup" 2>/dev/null || true
+fi
+
 # ── Report failure and exit early if rsync failed ───────────────────────────
 if [ "$RSYNC_EXIT" -ne 0 ]; then
     cp -f "$RSYNC_LOG" "$LAST_LOG" 2>/dev/null || true
