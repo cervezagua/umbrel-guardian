@@ -501,14 +501,14 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
         arg = parts[1].strip()
         if arg.lower() == "unhealthy":
             send_message(token, chat_id, "🔄 Restarting all unhealthy apps...")
-            out = run_script("restart_unhealthy.sh", timeout=120)
+            out = run_script("restart_unhealthy.sh", timeout=360)
             broadcast(token, chat_ids, out)
         else:
             if not valid_app_id(arg):
                 send_message(token, chat_id, "⚠️ Invalid app ID.")
                 return
             send_message(token, chat_id, f"🔄 Restarting {arg}...")
-            out = run_script("restart_app.sh", arg, timeout=180)
+            out = run_script("restart_app.sh", arg, timeout=240)
             broadcast(token, chat_ids, out)
 
     elif lower.startswith("/logs"):
