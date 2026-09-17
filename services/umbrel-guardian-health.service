@@ -10,3 +10,8 @@ StandardOutput=journal
 StandardError=journal
 # Exit 1 means "alerts were sent" — treat as success so the timer keeps running
 SuccessExitStatus=0 1
+# systemd's 90s default would SIGTERM a run part-way through. The health check
+# now probes SMART and the kernel journal, each individually timed out, but a
+# drive that is failing is exactly when those take longest — and killing the
+# check on the one node that needs it would be the worst possible time.
+TimeoutStartSec=300

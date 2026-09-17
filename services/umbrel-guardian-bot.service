@@ -25,8 +25,9 @@ CPUQuota=20%
 # invoke scripts/system_control.sh for /system_reboot, /system_shutdown,
 # /restart_docker, /restart_umbrel. Sudo needs setuid to escalate to root,
 # which NoNewPrivileges=yes blocks. The privilege boundary is enforced by
-# /etc/sudoers.d/umbrel-guardian-system, which permits only the five exact
-# subcommands of system_control.sh — nothing else.
+# /etc/sudoers.d/umbrel-guardian-system, which permits only an explicit list:
+# the five subcommands of system_control.sh plus the read-only disk_health.sh
+# and verify_backup.sh diagnostics — nothing else.
 
 [Install]
 WantedBy=multi-user.target

@@ -65,6 +65,11 @@ If a previous `config.env` exists, the installer asks before overwriting it — 
 | `/restart unhealthy` | 🔄 Restart apps in unknown/failed state (skips intentionally stopped apps) |
 | `/logs <app_id> [n]` | 📋 Last N lines of an app's container logs (default: 50) |
 | `/backup` | ⏳ Trigger a manual backup immediately |
+| `/verify_backup` | 🔍 Check the backup is actually restorable (add `deep` for a full file-by-file compare) |
+| `/disk_health` | 🩺 SMART attributes, SD/eMMC wear, and kernel I/O errors |
+| `/storage` | 💾 Per-app storage usage |
+| `/notifications` | 🔔 Pending umbrelOS notifications |
+| `/updates` | 🔄 umbrelOS version, release channel, and available updates |
 | `/system_reboot` | 🔄 Reboot the Pi (2-step confirm; +60s grace) |
 | `/system_shutdown` | ⏻ Power off the Pi (2-step confirm; needs physical access to restart) |
 | `/restart_docker` | 🔄 Restart Docker daemon (2-step confirm; briefly interrupts all containers) |
@@ -84,7 +89,7 @@ If a previous `config.env` exists, the installer asks before overwriting it — 
 
 If you miss the 30-second window, the confirmation expires and you have to start over. For reboot/shutdown there's an additional **60-second grace period** after confirmation during which `/system_cancel` aborts the operation.
 
-All four commands are blocked by `/lock` (you must `/unlock <PIN>` first). The sudoers entry at `/etc/sudoers.d/umbrel-guardian-system` allows *exactly* these five subcommands of `scripts/system_control.sh` — nothing else — and is re-deployed on every boot by `reinstall-services.sh` (because `/etc/sudoers.d/` is wiped each boot).
+All four commands are blocked by `/lock` (you must `/unlock <PIN>` first). The sudoers entry at `/etc/sudoers.d/umbrel-guardian-system` allows *exactly* these five subcommands of `scripts/system_control.sh`, plus the two read-only diagnostics `disk_health.sh` and `verify_backup.sh` — nothing else — and is re-deployed on every boot by `reinstall-services.sh` (because `/etc/sudoers.d/` is wiped each boot).
 
 ### `/restart` resolution
 
@@ -122,7 +127,16 @@ umbrel-guardian/
 │   ├── app_logs.sh             ← App container logs (docker compose)
 │   ├── health_check.sh         ← Proactive health alerts (timer)
 │   ├── backup.sh               ← rsync backup with flock + rotation
+│   ├── lib-backup-scope.sh     ← Shared: what is in scope / excluded (sourced, not run)
+│   ├── verify_backup.sh        ← Is the backup restorable? (fast + deep modes)
+│   ├── disk_health.sh          ← SMART / eMMC wear / kernel I/O errors (root)
+│   ├── umbrel_notifications.sh ← Relay umbrelOS notifications to Telegram
+│   ├── umbrel_update_check.sh  ← Update alerts + post-OTA self-check
+│   ├── storage_usage.sh        ← Per-app storage usage
+│   ├── system_control.sh       ← Privileged reboot/shutdown/restart wrapper (sudo)
 │   └── mount-backup.sh         ← Mount backup drive (udev + boot + safety net)
+│
+├── .state/                     ← Alert latches and seen-sets (gitignored, survives reboot)
 │
 ├── services/
 │   ├── umbrel-guardian-bot.service              ← Always-running bot
@@ -308,7 +322,7 @@ MemoryMax=128M
 CPUQuota=20%
 ```
 
-> `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to *exactly* five exact subcommands and nothing else.
+> `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands, and `disk_health.sh` / `verify_backup.sh` for diagnostics that need root. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to an explicit list of nine exact command lines and nothing else.
 
 ### Input Validation
 

@@ -108,6 +108,17 @@ chmod +x "$INSTALL_DIR/uninstall.sh" 2>/dev/null || true
 chmod +x "$INSTALL_DIR/install.sh" 2>/dev/null || true
 chmod +x "$INSTALL_DIR/custom-hooks/pre-start" 2>/dev/null || true
 
+# ── Persistent state directory ───────────────────────────────────────────────
+# Alert latches and seen-sets live here rather than under /run. /run is tmpfs,
+# so state there dies at every reboot and every monitor re-announces everything
+# it already told you about — which teaches you to ignore the alerts. This path
+# is inside the bot's ReadWritePaths (see umbrel-guardian-bot.service), so the
+# bot can write it despite ProtectSystem=strict, and it is gitignored.
+STATE_DIR="$INSTALL_DIR/.state"
+mkdir -p "$STATE_DIR"
+chown umbrel:umbrel "$STATE_DIR" 2>/dev/null || true
+chmod 750 "$STATE_DIR" 2>/dev/null || true
+
 # ── Ensure umbrel user is in docker group ────────────────────────────────────
 # OTA updates rebuild /etc/group, removing umbrel from supplementary groups.
 # Without docker membership, the bot (User=umbrel) cannot run `docker ps`,
@@ -245,6 +256,14 @@ umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/system_c
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/system_control.sh cancel
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/system_control.sh restart-docker
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/system_control.sh restart-umbrel
+
+# Read-only diagnostics that need root: smartctl talks to the raw device, and
+# the kernel journal is not world-readable. Neither script takes an argument
+# that could widen what it touches.
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --issues
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_backup.sh
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_backup.sh --deep
 SUDOERS_EOF
 # Validate with visudo before installing — a broken sudoers file breaks all sudo.
 if visudo -c -f "$TMP_SUDOERS" &>/dev/null; then

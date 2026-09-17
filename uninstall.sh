@@ -26,6 +26,11 @@ rm -f /etc/udev/rules.d/99-umbrel-backup.rules
 rm -f /usr/local/bin/mount-umbrel-backup.sh
 udevadm control --reload-rules 2>/dev/null || true
 
+echo "Removing inotify sysctl override..."
+# Guardian raised these system-wide; leaving them behind after an uninstall
+# would be a silent change to a machine that no longer runs Guardian.
+rm -f /etc/sysctl.d/40-inotify-umbrel.conf
+
 echo "Removing sudoers entries..."
 rm -f /etc/sudoers.d/umbrel-guardian
 rm -f /etc/sudoers.d/umbrel-guardian-system

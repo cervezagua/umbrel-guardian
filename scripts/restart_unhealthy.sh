@@ -16,7 +16,7 @@ if ! command -v umbreld &>/dev/null; then
 fi
 
 # Capture all output (stdout + stderr) — umbreld may write JSON to either.
-RAW=$(umbreld client apps.list.query 2>&1) || true
+RAW=$(timeout 10 umbreld client apps.list.query 2>&1) || true
 
 UNHEALTHY=$(echo "$RAW" | python3 -c "
 import sys, json
@@ -54,7 +54,7 @@ fi
 
 echo "🔄 Restart Results:"
 while IFS= read -r APP_ID; do
-    if umbreld client apps.restart.mutate --appId "$APP_ID" &>/dev/null; then
+    if timeout 60 umbreld client apps.restart.mutate --appId "$APP_ID" &>/dev/null; then
         echo "✅ Restarted: $APP_ID"
     else
         echo "⚠️ Failed:    $APP_ID"

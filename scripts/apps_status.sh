@@ -33,7 +33,7 @@ ALL=$(docker ps -a --format '{{.Names}} {{.State}}' 2>/dev/null)
 # if umbreld is unreachable.
 APP_STATES=""
 if command -v umbreld &>/dev/null; then
-    APP_STATES=$(umbreld client apps.list.query 2>&1 | python3 -c "
+    APP_STATES=$(timeout 10 umbreld client apps.list.query 2>&1 | python3 -c "
 import sys, json
 raw = sys.stdin.read()
 decoder = json.JSONDecoder()
