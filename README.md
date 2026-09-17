@@ -130,7 +130,13 @@ sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --import-history
 ```
 
 It reads the whole journal, not just the tail — you asked for it and granted it
-the time.
+the time — and it is **idempotent**: the imported history is kept in its own
+file (`.state/disk-health.imported`) and each import replaces the last, rather
+than adding to the running total. Two sources, two files, because the arithmetic
+differs: ring-buffer events are seen once and accumulate forever, while a
+history import is a snapshot of a window that overlaps everything it already
+reported. Mixing them would make the number the tool reports climb every time
+you ran the diagnostic.
 
 (A journal that cannot answer in 20 seconds is itself a symptom worth noticing.
 `sudo journalctl --vacuum-size=200M` is usually the fix — but **import first,
@@ -196,7 +202,7 @@ umbrel-guardian/
 │   ├── system_control.sh       ← Privileged reboot/shutdown/restart wrapper (sudo)
 │   └── mount-backup.sh         ← Mount backup drive (udev + boot + safety net)
 │
-├── .state/                     ← Alert latches, seen-sets, dmesg watermark (gitignored, survives reboot)
+├── .state/                     ← Alert latches, seen-sets, dmesg watermark, imported history (gitignored, survives reboot)
 │
 ├── services/
 │   ├── umbrel-guardian-bot.service              ← Always-running bot

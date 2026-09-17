@@ -60,6 +60,7 @@ STATE_DIR="$(dirname "$SCRIPT_DIR")/.state"
 STATE_FILE="$STATE_DIR/disk-health.state"
 COUNT_FILE="$STATE_DIR/disk-health.counts"
 DMESG_FILE="$STATE_DIR/disk-health.dmesg"
+IMPORT_FILE="$STATE_DIR/disk-health.imported"
 HISTORY_FILE="$STATE_DIR/disk-health.history"
 
 # shellcheck source=/dev/null
@@ -132,7 +133,7 @@ pin_dmesg_watermark() {
 }
 
 if [ "$MODE" = "reset" ]; then
-    rm -f "$STATE_FILE" "$COUNT_FILE" "$DMESG_FILE"
+    rm -f "$STATE_FILE" "$COUNT_FILE" "$DMESG_FILE" "$IMPORT_FILE"
     if pin_dmesg_watermark; then
         echo "✅ Disk health latches cleared. Kernel-log counting restarts from now."
     else
@@ -248,13 +249,32 @@ declare -A DELTA=()
 # read only ever sees what is new, which would never reach a meaningful bucket
 # on its own.
 declare -A TOTAL=()
-if [ -f "$COUNT_FILE" ]; then
-    while IFS='=' read -r _k _v; do
-        [ -n "${_k:-}" ] || continue
-        [[ "${_v:-}" =~ ^[0-9]+$ ]] || continue
-        TOTAL["$_k"]="$_v"
-    done < "$COUNT_FILE"
-fi
+load_counts() {
+    local file="$1" k v
+    [ -f "$file" ] || return 0
+    while IFS='=' read -r k v; do
+        [ -n "${k:-}" ] || continue
+        [[ "${v:-}" =~ ^[0-9]+$ ]] || continue
+        printf '%s\t%s\n' "$k" "$v"
+    done < "$file"
+}
+while IFS=$'\t' read -r _k _v; do
+    [ -n "${_k:-}" ] && TOTAL["$_k"]="$_v"
+done < <(load_counts "$COUNT_FILE")
+
+# journald history is kept SEPARATELY from the ring-buffer running total,
+# because the two are counted differently and mixing them corrupts both.
+#
+# Ring-buffer events are seen once and accumulate forever. A history import is
+# a snapshot of a window that overlaps everything it has already reported, so
+# importing twice would count the overlap twice — running a diagnostic would
+# make the number it reports go up. Keeping the snapshot in its own file lets
+# each import REPLACE the last, so --import-history is idempotent and can be
+# re-run freely after a vacuum or with a wider window.
+declare -A IMPORTED=()
+while IFS=$'\t' read -r _k _v; do
+    [ -n "${_k:-}" ] && IMPORTED["$_k"]="$_v"
+done < <(load_counts "$IMPORT_FILE")
 
 # One counting pass, shared by both sources. `wm` is a monotonic-clock
 # watermark: lines at or below it were counted by an earlier run. dmesg stamps
@@ -296,26 +316,38 @@ count_stream() {
     '
 }
 
-absorb() {   # stdin: "key count" lines → DELTA + TOTAL, and the new watermark
-    local key count
+# $1 = live (ring buffer: accumulate, advance the watermark)
+#    | import (journald snapshot: build a replacement set, ignore the watermark
+#              entirely — journald lines carry no ring-buffer clock)
+absorb() {
+    local mode="$1" key count
     while read -r key count; do
         [ -n "${key:-}" ] || continue
-        if [ "$key" = "__watermark__" ]; then NEW_WATERMARK="${count:-}"; continue; fi
-        DELTA["$key"]=$(( ${DELTA["$key"]:-0} + ${count:-1} ))
-        TOTAL["$key"]=$(( ${TOTAL["$key"]:-0} + ${count:-1} ))
+        if [ "$key" = "__watermark__" ]; then
+            [ "$mode" = "live" ] && NEW_WATERMARK="${count:-}"
+            continue
+        fi
+        if [ "$mode" = "import" ]; then
+            IMPORTED["$key"]=$(( ${IMPORTED["$key"]:-0} + ${count:-1} ))
+        else
+            DELTA["$key"]=$(( ${DELTA["$key"]:-0} + ${count:-1} ))
+            TOTAL["$key"]=$(( ${TOTAL["$key"]:-0} + ${count:-1} ))
+        fi
     done
 }
 
-persist_counts() {
-    local tmp="${COUNT_FILE}.tmp.$$" k
-    [ -n "${TOTAL[*]:-}" ] || return 0
+write_counts() {   # $1 = file, $2 = name of the associative array to write
+    local file="$1" tmp="$1.tmp.$$" k
+    local -n _src="$2"
+    [ -n "${_src[*]:-}" ] || return 0
     : > "$tmp" 2>/dev/null || return 1
-    for k in ${TOTAL[@]+"${!TOTAL[@]}"}; do
-        printf '%s=%s\n' "$k" "${TOTAL[$k]}" >> "$tmp"
+    for k in ${_src[@]+"${!_src[@]}"}; do
+        printf '%s=%s\n' "$k" "${_src[$k]}" >> "$tmp"
     done
-    mv -f "$tmp" "$COUNT_FILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp"; return 1; }
     return 0
 }
+persist_counts() { write_counts "$COUNT_FILE" TOTAL; }
 
 NEW_WATERMARK=""
 
@@ -334,19 +366,17 @@ NEW_WATERMARK=""
 # only the tail in that case quietly answers a narrower question than the one
 # being asked, and reports it as if it were the whole answer.
 import_history() {
-    local budget="$1" limit="${2:-$BOOTSTRAP_LINES}" raw rc saved="${NEW_WATERMARK:-}"
+    local budget="$1" limit="${2:-$BOOTSTRAP_LINES}" raw rc
     local -a args=(-k --no-pager)
     [ "$limit" = "all" ] || args+=(-n "$limit")
     raw=$(timeout "$budget" journalctl "${args[@]}" 2>/dev/null | count_stream -1)
     rc=$?
     if [ "$rc" -ne 0 ]; then return "$rc"; fi
-    absorb <<< "${raw:-}"
-    # journald lines carry no ring-buffer clock, so this import must not disturb
-    # the watermark the dmesg read just established. Restoring it explicitly
-    # rather than trusting that journalctl never emits a "[123.456]" prefix:
-    # getting that wrong silently makes the ring buffer re-count itself forever,
-    # which is how this was caught.
-    NEW_WATERMARK="$saved"
+    # Replace, never extend: the new window overlaps the old one, so adding
+    # would count the overlap twice and make the reported total climb every
+    # time someone ran the diagnostic.
+    IMPORTED=()
+    absorb import <<< "${raw:-}"
     return 0
 }
 
@@ -356,7 +386,7 @@ if [ "$MODE" = "import" ]; then
     fi
     echo "Reading kernel log history from journald (up to ${JOURNAL_IMPORT_TIMEOUT}s)…"
     if import_history "$JOURNAL_IMPORT_TIMEOUT" all; then
-        persist_counts && echo "imported" > "$HISTORY_FILE" 2>/dev/null
+        write_counts "$IMPORT_FILE" IMPORTED && echo "imported" > "$HISTORY_FILE" 2>/dev/null
         echo "✅ History imported. Run $0 to see the result."
     else
         echo "skipped:timeout" > "$HISTORY_FILE" 2>/dev/null
@@ -384,11 +414,12 @@ if [ "$IS_ROOT" -eq 1 ] && command -v dmesg &>/dev/null; then
     DMESG_RC=$?
     if [ "$DMESG_RC" -eq 0 ]; then
         KERNEL_LOG_OK=1
-        absorb <<< "${DMESG_OUT:-}"
+        absorb live <<< "${DMESG_OUT:-}"
 
         # On the very first run, also try journald once for pre-install history.
         if [ ! -f "$HISTORY_FILE" ] && command -v journalctl &>/dev/null; then
             if import_history "$JOURNAL_BOOTSTRAP_TIMEOUT"; then
+                write_counts "$IMPORT_FILE" IMPORTED
                 echo "imported" > "$HISTORY_FILE" 2>/dev/null
             else
                 echo "skipped:timeout" > "$HISTORY_FILE" 2>/dev/null
@@ -498,6 +529,7 @@ fi
 # keep being reported, or the alert would silently clear itself.
 ALL_KEYS=$( { printf '%s\n' ${LIVE[@]+"${!LIVE[@]}"}
               printf '%s\n' ${TOTAL[@]+"${!TOTAL[@]}"}
+              printf '%s\n' ${IMPORTED[@]+"${!IMPORTED[@]}"}
               [ -f "$STATE_FILE" ] && cut -d= -f1 "$STATE_FILE" 2>/dev/null
             } | grep -v '^$' | LC_ALL=C sort -u )
 
@@ -525,7 +557,7 @@ if [ -n "$ALL_KEYS" ]; then
         # meaning is the running total. LIVE holds the former, TOTAL the latter,
         # and the two key namespaces never overlap.
         GAUGE="${LIVE[$KEY]:-0}"
-        COUNT="${TOTAL[$KEY]:-0}"
+        COUNT=$(( ${TOTAL[$KEY]:-0} + ${IMPORTED[$KEY]:-0} ))
         [ "$GAUGE" -gt 0 ] && COUNT="$GAUGE"
         B=$(latch "$KEY" "$(bucket "$COUNT")")
         [ "$B" -lt "$(threshold "$KEY")" ] && continue
