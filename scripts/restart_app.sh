@@ -6,6 +6,15 @@ set -uo pipefail
 
 APP="${1:-}"
 
+# 120s, not 60. A restart is a stop plus a start of every container an app
+# owns, and `umbreld client` itself costs ~19s from inside the bot's CPUQuota
+# before the work even begins (measured: 1.8s unconstrained, 19.25s throttled).
+# 60s was plausibly the whole reason /restart_plex "failed" on a node where the
+# app was simply slow to come back. The bot's budget for this script is set
+# above 45 + RESTART_TIMEOUT so the script always gets to say what happened
+# rather than being killed mid-sentence.
+RESTART_TIMEOUT=120
+
 if [ -z "$APP" ]; then
     echo "⚠️ Usage: restart_app.sh <app_id>"
     exit 1
@@ -24,7 +33,7 @@ fi
 #      its dash-substituted form), use it. Lets `/restart adguard` → adguard-home.
 #   4. If multiple prefix matches, report them all so the user can be specific.
 # Capture all output (stdout + stderr) — umbreld may write JSON to either.
-RAW=$(umbreld client apps.list.query 2>&1) || true
+RAW=$(timeout 45 umbreld client apps.list.query 2>&1) || true
 RESPONSE=$(echo "$RAW" | python3 -c "
 import sys, json
 
@@ -84,9 +93,26 @@ case "$RESPONSE" in
         ;;
 esac
 
-if umbreld client apps.restart.mutate --appId "$APP" &>/dev/null; then
+# &>/dev/null here used to throw away the only evidence of what went wrong,
+# and the message then blamed the app id — which the block above had JUST
+# resolved against the installed list. Being told to check something already
+# verified sends you looking in the one place the fault cannot be.
+RESTART_OUT=$(timeout "$RESTART_TIMEOUT" umbreld client apps.restart.mutate --appId "$APP" 2>&1)
+RESTART_RC=$?
+
+if [ "$RESTART_RC" -eq 0 ]; then
     echo "✅ Restarted: $APP"
-else
-    echo "⚠️ Failed to restart $APP — check that the app ID is correct."
-    exit 1
+    exit 0
 fi
+
+if [ "$RESTART_RC" -eq 124 ]; then
+    echo "⏳ Restart of $APP did not finish within ${RESTART_TIMEOUT}s."
+    echo "   umbreld accepted the request; the app may still be coming back."
+    echo "   Check /apps in a minute before trying again."
+else
+    echo "⚠️ umbreld could not restart $APP (exit $RESTART_RC)."
+    DETAIL=$(printf '%s' "${RESTART_OUT:-}" | grep -v '^[[:space:]]*$' | tail -3 | cut -c1-200)
+    [ -n "${DETAIL:-}" ] && printf '   %s\n' "$DETAIL"
+fi
+echo "   The app id resolved to \"$APP\" against the installed list, so this is not a typo."
+exit 1

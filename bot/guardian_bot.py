@@ -110,7 +110,17 @@ def rate_limited(chat_id):
 
 _locked = False
 
-SAFE_COMMANDS = {"/status", "/help", "/start", "/lock", "/unlock", "/uptime", "/apps", "/health"}
+# Read-only commands that stay available in safe mode. Everything here must be
+# incapable of changing the node's state.
+SAFE_COMMANDS = {"/status", "/help", "/start", "/lock", "/unlock", "/uptime", "/apps", "/health",
+                 "/disk_health", "/disks", "/verify_backup", "/notifications", "/updates", "/storage"}
+
+# Shown by /lock. Generated rather than written out, because a hardcoded list
+# silently lies the moment SAFE_COMMANDS changes — and a wrong list in safe mode
+# is exactly when you least want to be guessing what still works.
+def _safe_command_list():
+    hidden = {"/start", "/lock", "/unlock", "/disks"}   # aliases and the lock verbs themselves
+    return ", ".join(sorted(SAFE_COMMANDS - hidden))
 
 
 def handle_lock(text, token, chat_id, cfg):
@@ -127,7 +137,7 @@ def handle_lock(text, token, chat_id, cfg):
             return True
         _locked = True
         send_message(token, chat_id,
-                     "🔒 Safe mode ON. Only /status, /help, /apps, /uptime, /health active.\n"
+                     f"🔒 Safe mode ON. Still available: {_safe_command_list()}\n"
                      "Use /unlock <PIN> to restore.")
         return True
 
@@ -260,6 +270,42 @@ def run_script(script_name, *args, timeout=60):
         return f"⚠️ Error running {script_name}: {e}"
 
 
+def run_privileged_script(script_name, *args, timeout=60):
+    """Run a scripts/ helper as root via `sudo -n`.
+
+    For the diagnostics that genuinely need root: smartctl talks to the raw
+    device, the kernel journal is not world-readable, and the backup mirror is
+    root-owned. `-n` never prompts, so a missing sudoers file fails immediately
+    instead of hanging the bot waiting for a password nobody can type into a
+    chat window.
+    """
+    script_path = os.path.join(SCRIPTS_DIR, script_name)
+    if not os.path.isfile(script_path):
+        return f"⚠️ Script not found: {script_name}"
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", script_path] + list(args),
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        stderr = result.stderr or ""
+        # sudo itself refusing is worth distinguishing from the script failing:
+        # /etc/sudoers.d/ is wiped on every boot and restamped by the pre-start
+        # hook, so this is a known, recoverable state with a known fix.
+        if result.returncode != 0 and ("sudo:" in stderr or "a password is required" in stderr):
+            return ("⚠️ Could not run this as root.\n"
+                    "/etc/sudoers.d/ is cleared on every boot and restamped by the "
+                    "pre-start hook. If this keeps happening, run:\n"
+                    "sudo bash reinstall-services.sh")
+        output = result.stdout.strip() or stderr.strip()
+        return output or "(no output)"
+    except subprocess.TimeoutExpired:
+        return f"⚠️ Command timed out after {timeout} seconds."
+    except Exception as e:
+        return f"⚠️ Error running {script_name}: {e}"
+
+
 HELP_TEXT = r"""🛡 *Umbrel Guardian*
 
 *Commands:*
@@ -271,6 +317,11 @@ HELP_TEXT = r"""🛡 *Umbrel Guardian*
 /restart unhealthy — Restart apps in unknown/failed state
 /logs \<app\_id\> \[lines\] — Recent container logs \(default: 50\)
 /backup — Trigger a manual backup now
+/verify\_backup — Check the backup is restorable \(add `deep` for a full compare\)
+/disk\_health — SMART, SD/eMMC wear and kernel I/O errors
+/storage — Per\-app storage usage
+/notifications — Pending umbrelOS notifications
+/updates — umbrelOS version and available updates
 /system\_reboot — Reboot the Pi \(2\-step confirm\)
 /system\_shutdown — Power off the Pi \(2\-step confirm\)
 /restart\_docker — Restart Docker daemon \(2\-step confirm\)
@@ -406,7 +457,7 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
         send_message(token, chat_id, HELP_TEXT, parse_mode="MarkdownV2")
 
     elif lower == "/status":
-        out = run_script("system_status.sh")
+        out = run_script("system_status.sh", timeout=90)
         send_message(token, chat_id, out)
 
     elif lower == "/uptime":
@@ -429,14 +480,14 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
 
     elif lower == "/health":
         send_message(token, chat_id, "🔍 Running health check...")
-        out = run_script("health_check.sh", "--force")
+        out = run_script("health_check.sh", "--force", timeout=120)
         # health_check.sh sends alerts directly via telegram_send.sh,
         # so we only need to reply if there was no output (script handles notification)
         if "Script not found" in out or "Error running" in out:
             send_message(token, chat_id, out)
 
     elif lower == "/apps":
-        out = run_script("apps_status.sh")
+        out = run_script("apps_status.sh", timeout=90)
         send_message(token, chat_id, out)
 
     elif lower.startswith("/restart"):
@@ -450,14 +501,14 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
         arg = parts[1].strip()
         if arg.lower() == "unhealthy":
             send_message(token, chat_id, "🔄 Restarting all unhealthy apps...")
-            out = run_script("restart_unhealthy.sh", timeout=120)
+            out = run_script("restart_unhealthy.sh", timeout=360)
             broadcast(token, chat_ids, out)
         else:
             if not valid_app_id(arg):
                 send_message(token, chat_id, "⚠️ Invalid app ID.")
                 return
             send_message(token, chat_id, f"🔄 Restarting {arg}...")
-            out = run_script("restart_app.sh", arg, timeout=180)
+            out = run_script("restart_app.sh", arg, timeout=240)
             broadcast(token, chat_ids, out)
 
     elif lower.startswith("/logs"):
@@ -491,6 +542,33 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
                 f.write("")
         except OSError as e:
             send_message(token, chat_id, f"❌ Could not trigger backup: {e}")
+
+    elif lower in ("/disk_health", "/disks"):
+        # 120s: SMART probes on a sick drive are exactly the slow case, and the
+        # script bounds each sub-probe itself.
+        send_message(token, chat_id, run_privileged_script("disk_health.sh", timeout=120))
+
+    elif lower.startswith("/verify_backup"):
+        parts = lower.split()
+        want_deep = len(parts) > 1 and parts[1] == "deep"
+        if want_deep and _locked:
+            send_message(token, chat_id,
+                         "🔒 Safe mode: the quick check is available, but the deep scan "
+                         "starts a background job. Use /unlock <PIN> first.")
+        elif want_deep:
+            send_message(token, chat_id, run_privileged_script("verify_backup.sh", "--deep"))
+        else:
+            send_message(token, chat_id, run_privileged_script("verify_backup.sh"))
+
+    elif lower == "/notifications":
+        send_message(token, chat_id, run_script("umbrel_notifications.sh", "--list", timeout=90))
+
+    elif lower == "/updates":
+        send_message(token, chat_id, run_script("umbrel_update_check.sh", "--report", timeout=90))
+
+    elif lower == "/storage":
+        # Was already written and working, just never wired to anything.
+        send_message(token, chat_id, run_script("storage_usage.sh", timeout=120))
 
     else:
         send_message(token, chat_id, f"Unknown command: {text}\nUse /help to see available commands.")

@@ -2,6 +2,8 @@
 config.env
 .backup.lock
 .backup-trigger
+.state/
+last-backup-rsync.log
 
 # Python virtual environment — recreated by install.sh / reinstall-services.sh
 .venv/

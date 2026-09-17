@@ -43,7 +43,12 @@ else
 fi
 
 if [ "${DISK_USE:-0}" -gt "$THRESHOLD" ]; then
-    ISSUES+=("⚠️ Disk ${DISK_LABEL} at ${DISK_USE}% (threshold: ${THRESHOLD}%)")
+    # Report a 5% band rather than the live figure. The fingerprint below covers
+    # this string, so "at 91%" → "at 92%" reads as a brand new problem and
+    # re-alerts every 30 minutes for as long as the disk stays full — which is
+    # precisely when you least want to be trained to ignore the alert.
+    DISK_BAND=$(( DISK_USE / 5 * 5 ))
+    ISSUES+=("⚠️ Disk ${DISK_LABEL} is over ${DISK_BAND}% full (threshold: ${THRESHOLD}%)")
 fi
 
 # ── App health check ────────────────────────────────────────────────────────
@@ -56,10 +61,21 @@ fi
 # We only alert on "unknown" so transient states don't flap and stopped
 # apps (which the user deliberately turned off) don't trigger alerts.
 if command -v umbreld &>/dev/null; then
-    APP_ISSUES=$(umbreld client apps.list.query 2>&1 | python3 - <<'PYEOF'
-import sys, json
+    # The app list reaches Python through the ENVIRONMENT, not a pipe.
+    #
+    # `python3 -` reads its program from stdin, so the heredoc below claims
+    # stdin — silently overriding the pipe. sys.stdin.read() returned '' on
+    # every single run, which means this check has never once reported an
+    # unhealthy app since it was written. shellcheck SC2259 catches it.
+    #
+    # The heredoc stays (this script needs both quote styles internally, so
+    # collapsing it into python3 -c would be a quoting minefield); only the data
+    # path moves.
+    APP_RAW=$(timeout 45 umbreld client apps.list.query 2>&1)
+    APP_ISSUES=$(APP_RAW="$APP_RAW" python3 - <<'PYEOF'
+import os, json
 
-raw = sys.stdin.read()
+raw = os.environ.get("APP_RAW", "")
 decoder = json.JSONDecoder()
 apps = None
 try:
@@ -92,11 +108,32 @@ PYEOF
     done <<< "${APP_ISSUES:-}"
 fi
 
+# ── Disk health ──────────────────────────────────────────────────────────────
+# Runs as root via sudo -n: smartctl needs the raw device and the kernel journal
+# is not world-readable. Silent when that is unavailable — /etc/sudoers.d/ is
+# wiped on every boot and restamped by the pre-start hook, so there is a window
+# where this legitimately cannot run, and alerting on it would fire a spurious
+# "monitoring is broken" after every reboot.
+#
+# disk_health.sh emits deterministic, bucketed lines precisely so they can join
+# ISSUES without breaking the fingerprint below.
+DISK_HEALTH="$SCRIPT_DIR/disk_health.sh"
+if [ -x "$DISK_HEALTH" ]; then
+    DISK_ISSUES=$(sudo -n "$DISK_HEALTH" --issues 2>/dev/null || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] && ISSUES+=("$line")
+    done <<< "${DISK_ISSUES:-}"
+fi
+
 # ── Deduplication ────────────────────────────────────────────────────────────
 # Build a deterministic fingerprint of the current issues.
 # Only send notifications when this fingerprint differs from last run.
 ISSUE_COUNT="${#ISSUES[@]}"
-STATE_TEXT="$(printf "%s\n" "${ISSUES[@]}" 2>/dev/null | sort)"
+# LC_ALL=C: collation is locale-dependent, and the sorted text feeds the hash.
+# Under en_US.UTF-8 glibc orders "a-item A-item b-item _item" where C gives
+# "A-item _item a-item b-item" — same issues, different fingerprint, spurious
+# re-alert. Pinning the collation makes the fingerprint depend only on content.
+STATE_TEXT="$(printf "%s\n" "${ISSUES[@]}" 2>/dev/null | LC_ALL=C sort)"
 CURRENT_HASH="$(printf "%s" "$STATE_TEXT" | sha256sum | awk '{print $1}')"
 LAST_HASH="$(cat "$STATE_FILE" 2>/dev/null || true)"
 
@@ -132,6 +169,22 @@ elif [[ "$CURRENT_HASH" != "$LAST_HASH" ]]; then
     # Save new state (whether issues or all-clear, so we detect recovery)
     echo "$CURRENT_HASH" > "$STATE_FILE"
 fi
+
+# ── Side channels ────────────────────────────────────────────────────────────
+# These report for themselves rather than joining ISSUES, deliberately. The
+# fingerprint above describes a STATE — what is wrong right now — and has to
+# stay stable for dedup to work. A notification or an update is an EVENT: it
+# happens once. Folding events into the state would change the hash every time
+# one arrived and re-announce every unrelated issue alongside it. Each keeps its
+# own seen-set instead.
+#
+# Piggybacking the health timer rather than adding units: both want exactly this
+# cadence and this user. Failures here never affect the health result.
+for SIDE in umbrel_notifications.sh umbrel_update_check.sh; do
+    if [ -x "$SCRIPT_DIR/$SIDE" ]; then
+        "$SCRIPT_DIR/$SIDE" &>/dev/null || true
+    fi
+done
 
 # Non-zero exit tells systemd that alerts were sent (visible in systemctl status)
 exit $(( SENT > 0 ? 1 : 0 ))

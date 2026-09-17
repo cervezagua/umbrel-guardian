@@ -16,7 +16,34 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="$(dirname "$SCRIPT_DIR")/config.env"
 SEND="$SCRIPT_DIR/telegram_send.sh"
 
+# shellcheck source=/dev/null
 source "$CONFIG"
+# Shared with verify_backup.sh — defines what is in scope and what is excluded.
+#
+# Hard-fail if it is missing. Without it the exclude list comes out EMPTY and the
+# clone happily copies external/ — the backup drive umbrelOS may have mounted
+# inside the source — into itself, while still reporting "Backup complete". A
+# partial deploy is exactly how that happens, and a backup that looks successful
+# and is not is worse than one that refuses to run.
+if [ ! -r "$SCRIPT_DIR/lib-backup-scope.sh" ]; then
+    "$SEND" "⚠️ Backup ABORTED: scripts/lib-backup-scope.sh is missing or unreadable.
+It defines which paths are excluded — without it the clone could copy the backup
+drive into itself. Guardian looks partially deployed.
+Re-deploy: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh"
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib-backup-scope.sh"
+
+# A truncated or half-written file sources without error but defines nothing,
+# which fails the same silent way. Assert the contract, not just the file.
+for _fn in guardian_full_clone_excludes guardian_db_excludes guardian_as_rsync_args; do
+    if ! declare -F "$_fn" >/dev/null 2>&1; then
+        "$SEND" "⚠️ Backup ABORTED: lib-backup-scope.sh loaded but $_fn is undefined.
+The file looks truncated or corrupt. Re-deploy Guardian before backing up again."
+        exit 1
+    fi
+done
 
 # Remove trigger file so the systemd .path unit resets for the next manual /backup
 rm -f "$(dirname "$SCRIPT_DIR")/.backup-trigger" 2>/dev/null || true
@@ -173,73 +200,23 @@ RESUMED=false
 RSYNC_OPTS=( -a --timeout="$RSYNC_TIMEOUT" --stats )
 
 # ── Full-clone excludes ─────────────────────────────────────────────────────
-# Every pattern here is anchored with a leading slash so it matches only at the
-# top of the transfer root. Without the anchor, "external" would also match an
-# app's own app-data/<app>/external directory.
-
-# MOUNT POINTS — not configurable, because this is a correctness property.
-#
-# umbrelOS mounts things *inside* the directory we are backing up:
-#   external/<Label>  every external USB drive (files.ts: '/External')
-#   network/          mounted NAS/SMB shares   (files.ts: '/Network')
-#   backups/          umbrelOS's own backup repo mount
-#
-# The external auto-mount is not gated on Raspberry Pi — the "not supported on
-# Pi" screen in the UI only covers choosing an external drive as a *backup
-# destination*. Files mounts any USB partition that is not already mounted, and
-# it decides that by checking whether the partition has a mountpoint already.
-# Guardian's own udev rule usually wins that race, which is the only reason the
-# backup drive normally lands outside the source tree. umbrelOS mounts on a
-# D-Bus device event with no polling and no retry, so the race is not ours to
-# rely on: if it ever wins, the backup drive appears at external/<Label> and a
-# full clone copies the backup into itself until the drive fills. That fails as
-# "write error: Broken pipe ... error in socket IO (code 10)" hours in — the
-# receiver dying of ENOSPC, with nothing in the message naming the real cause.
-#
-# Backing up other people's drives and NAS shares would be wrong even if it were
-# safe, so these stay excluded regardless.
-RSYNC_EXCLUDES=(
-    --exclude=/external/
-    --exclude=/network/
-    --exclude=/backups/
+# Defined in lib-backup-scope.sh so verify_backup.sh reads the same list. If the
+# two ever diverged, every path they disagreed on would surface as phantom drift
+# and a perfectly good backup would be reported as broken.
+mapfile -t RSYNC_EXCLUDES < <(
+    guardian_full_clone_excludes "${BACKUP_EXCLUDE_CHURN:-y}" | guardian_as_rsync_args
 )
 
-# CHURN — mirrors umbrelOS's own .kopiaignore. Everything here is either a
-# regenerable cache, an incomplete staging copy, or per-device material that a
-# restore recreates anyway; copying it burns USB write cycles and backup window
-# for data that would be discarded on restore. Upstream additionally notes that
-# machines/*/media can contain password hashes and Windows product keys.
-if [ "${BACKUP_EXCLUDE_CHURN:-y}" = "y" ]; then
-    RSYNC_EXCLUDES+=(
-        --exclude=/app-stores/
-        --exclude=/thumbnails/
-        --exclude=/file-index/
-        --exclude=/kopia/
-        --exclude=/.temporary-migration/
-        --exclude=/app-data/*/.data-moving-*
-        --exclude=/machine-images/
-        --exclude=/machines/*/operations
-        --exclude=/machines/*/media
-        --exclude=/lan-ingress/
-    )
-fi
-
 # umbrel.db is umbreld's SQLite database, introduced after 1.7.x. A live copy of
-# the database alongside its -wal and -shm is not a consistent snapshot: upstream
-# excludes exactly these from its own backups because "SQLite's database, WAL,
-# and shared-memory files cannot be copied independently while writes and
-# checkpoints continue". We exclude them from the transfer and write a proper
-# snapshot afterwards instead. On a version that has no umbrel.db this block is
-# skipped entirely and nothing changes.
+# it alongside its -wal and -shm is not a consistent snapshot, so we exclude all
+# of them from the transfer and write a proper snapshot afterwards instead. On a
+# version that has no umbrel.db this adds nothing and nothing changes.
 UMBREL_DB="$UMBREL_SRC/umbrel.db"
 SNAPSHOT_DB=false
 if [ "$FULL_CLONE" = true ] && [ -f "$UMBREL_DB" ]; then
     SNAPSHOT_DB=true
-    RSYNC_EXCLUDES+=(
-        --exclude=/umbrel.db
-        --exclude=/umbrel.db-wal
-        --exclude=/umbrel.db-shm
-        --exclude=/umbrel.db-journal
+    mapfile -t -O "${#RSYNC_EXCLUDES[@]}" RSYNC_EXCLUDES < <(
+        guardian_db_excludes "$UMBREL_SRC" | guardian_as_rsync_args
     )
 fi
 
@@ -338,6 +315,24 @@ elif [ "$RSYNC_EXIT" -eq 0 ]; then
     mv "$DEST_TMP" "$DEST"
 else
     rm -rf "$DEST_TMP"
+fi
+
+# ── Record that a backup completed ───────────────────────────────────────────
+# verify_backup.sh reads this to answer "how old is the backup", and without it
+# falls back to the systemd unit's ExecMainExitTimestamp — which knows nothing
+# about a run started by hand, and reports "unknown" one minute after a backup
+# finished. An answer that says "I cannot tell" when it plainly could is worse
+# than no line at all: it is the one number you check before trusting a restore.
+#
+# On the destination, not in .state/: it describes the mirror, so it belongs
+# beside the mirror. A drive moved to another machine carries its own age with
+# it, and a rebuilt node with an empty .state/ still learns when this backup
+# was taken.
+#
+# Written only on success. A stamp refreshed by a failed run would age-out the
+# real answer and make a stale mirror look current.
+if [ "$RSYNC_EXIT" -eq 0 ]; then
+    : > "$DEST_BASE/.umbrel-guardian-last-backup" 2>/dev/null || true
 fi
 
 # ── Report failure and exit early if rsync failed ───────────────────────────
