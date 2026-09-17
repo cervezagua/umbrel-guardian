@@ -52,7 +52,12 @@ esac
 # unit allows 300s total and the bot waits 120s, so every external call is
 # individually bounded rather than trusting the whole script to finish.
 SMART_TIMEOUT=20
-JOURNAL_TIMEOUT=10
+# 60s. Reading seven days of kernel journal is not a quick operation on a Pi,
+# and under the bot's CPUQuota=20% it is roughly ten times slower again. A 10s
+# budget here silently produced "no errors found" on a node whose journal
+# contained four — see the failure handling below, which is the part that made
+# that silent rather than obvious.
+JOURNAL_TIMEOUT=60
 
 say() { [ "$MODE" = "report" ] && echo "$1"; return 0; }
 
@@ -180,11 +185,29 @@ if [ "$IS_ROOT" -eq 1 ] && command -v journalctl &>/dev/null; then
             if (ro + 0 > 0)     print "readonly " (ro + 0)
         }
     ')
-    KERNEL_LOG_OK=1
-    if [ -n "${KERNEL_SUMMARY:-}" ]; then
-        while read -r key count; do
-            [ -n "${key:-}" ] && record "$key" "${count:-1}"
-        done <<< "$KERNEL_SUMMARY"
+    # Check whether the probe actually SUCCEEDED. This was previously set to 1
+    # unconditionally, which meant a timed-out journal read was indistinguishable
+    # from a healthy disk: empty output, nothing recorded, and a confident
+    # "No disk problems detected" on a node that had logged I/O errors.
+    #
+    # A monitoring tool reporting all-clear because its probe failed is worse
+    # than one that crashes — you would believe it. Never infer health from the
+    # absence of evidence you failed to collect.
+    KERNEL_RC=$?
+    if [ "$KERNEL_RC" -eq 0 ]; then
+        KERNEL_LOG_OK=1
+        if [ -n "${KERNEL_SUMMARY:-}" ]; then
+            while read -r key count; do
+                [ -n "${key:-}" ] && record "$key" "${count:-1}"
+            done <<< "$KERNEL_SUMMARY"
+        fi
+    else
+        # Surfaced as a real issue, not a footnote. The text is fixed, so it
+        # alerts once rather than every 30 minutes, and it says plainly that
+        # disk monitoring is currently blind rather than that the disks are fine.
+        KERNEL_PROBE_ERROR=$([ "$KERNEL_RC" -eq 124 ] \
+            && echo "timed out after ${JOURNAL_TIMEOUT}s" \
+            || echo "failed (exit $KERNEL_RC)")
     fi
 fi
 
@@ -279,6 +302,15 @@ say "🩺 Disk Health"
 say "━━━━━━━━━━━━━━━━━━"
 
 PROBLEMS=0
+
+# Blindness is reported before findings, because it changes what the findings
+# mean: "no problems detected" is only reassuring if the detector ran.
+if [ -n "${KERNEL_PROBE_ERROR:-}" ]; then
+    PROBLEMS=$((PROBLEMS + 1))
+    LINE="⚠️ Disk monitoring is degraded — the kernel log probe ${KERNEL_PROBE_ERROR}. Disk errors would not be seen."
+    if [ "$MODE" = "issues" ]; then echo "$LINE"; else say "  $LINE"; fi
+fi
+
 if [ -n "$ALL_KEYS" ]; then
     while read -r KEY; do
         [ -n "$KEY" ] || continue
@@ -302,7 +334,13 @@ if [ -n "$ALL_KEYS" ]; then
 fi
 
 if [ "$MODE" = "report" ]; then
-    [ "$PROBLEMS" -eq 0 ] && say "  ✅ No disk problems detected"
+    if [ "$PROBLEMS" -eq 0 ]; then
+        if [ "$KERNEL_LOG_OK" -eq 1 ]; then
+            say "  ✅ No disk problems detected"
+        else
+            say "  ⚠️ No problems found, but the kernel log was not read — this is not an all-clear"
+        fi
+    fi
     say ""
     if [ "$IS_ROOT" -eq 0 ]; then
         say "  ⚠️ Not running as root — SMART and kernel-log checks were skipped."
