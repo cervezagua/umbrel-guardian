@@ -125,14 +125,47 @@ fi
 # systemd-ask-password-console.path) to fail with "inotify watch limit reached".
 # OTA wipes /etc/sysctl.d/, so we re-deploy on each reinstall.
 SYSCTL_CONF=/etc/sysctl.d/40-inotify-umbrel.conf
-if [ ! -f "$SYSCTL_CONF" ]; then
-    cat > "$SYSCTL_CONF" <<'SYSCTL_EOF'
-fs.inotify.max_user_watches=524288
-fs.inotify.max_user_instances=512
+WANT_WATCHES=524288
+WANT_INSTANCES=512
+
+# Always rewrite the file rather than testing for it: it lives on the OS
+# partition, so an OTA replaces it, and writing it is free.
+cat > "$SYSCTL_CONF" <<SYSCTL_EOF
+fs.inotify.max_user_watches=$WANT_WATCHES
+fs.inotify.max_user_instances=$WANT_INSTANCES
 SYSCTL_EOF
-    sysctl --system &>/dev/null || true
+
+# Then assert the LIVE values, which is the part that actually matters.
+# Testing for the file's existence was not enough. This script only runs from
+# custom-hooks/pre-start when Guardian's units are missing, so on a boot that
+# keeps /etc/systemd/system but resets the running sysctls, the config file is
+# still sitting there while the kernel is back on its defaults — and the old
+# `[ ! -f ]` guard short-circuited and never reapplied anything. The symptom is
+# precisely what this block exists to prevent: systemd-ask-password-console.path
+# fails with "inotify watch limit reached" and interactive sudo stops accepting
+# passwords, which locks you out of the machine you need root on to fix it.
+#
+# Only ever raise. If something else set a higher limit, leave it alone.
+INOTIFY_RAISED=0
+for KEY in max_user_watches max_user_instances; do
+    case "$KEY" in
+        max_user_watches)   WANT=$WANT_WATCHES ;;
+        max_user_instances) WANT=$WANT_INSTANCES ;;
+    esac
+    LIVE=$(sysctl -n "fs.inotify.$KEY" 2>/dev/null || true)
+    [[ "$LIVE" =~ ^[0-9]+$ ]] || LIVE=0
+    if [ "$LIVE" -lt "$WANT" ]; then
+        sysctl -w "fs.inotify.$KEY=$WANT" &>/dev/null || true
+        INOTIFY_RAISED=1
+        echo "  ✅ inotify $KEY: $LIVE → $WANT"
+    fi
+done
+if [ "$INOTIFY_RAISED" -eq 1 ]; then
+    # The .path unit fails permanently once it cannot register its watch, so it
+    # needs clearing before systemd will start it again.
     systemctl reset-failed umbrel-guardian-backup-trigger.path 2>/dev/null || true
-    echo "  ✅ Bumped inotify limits via $SYSCTL_CONF"
+else
+    echo "  ✅ inotify limits already sufficient"
 fi
 
 # ── Clean up legacy bootstrap unit ───────────────────────────────────────────
