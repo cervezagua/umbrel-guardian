@@ -238,11 +238,26 @@ fi
 
 # A read-only remount is how a failing drive presents itself: everything looks
 # mounted and present, and every future backup silently fails to write.
-if ! touch "$DEST_BASE/.guardian-write-test" 2>/dev/null; then
-    echo "❌ Backup drive is not writable — mounted read-only, or the filesystem has faulted"
-    PROBLEMS=$((PROBLEMS + 1))
+#
+# But the test is only meaningful outside the bot's sandbox. umbrel-guardian-bot
+# .service sets ProtectSystem=strict, which remounts the whole filesystem
+# read-only for the service and everything it spawns — sudo included, because
+# sudo does not escape a mount namespace. Run from the bot, this write would
+# fail on a perfectly healthy drive and report a fault that is not there.
+#
+# /etc is the canary: root can write it normally, and cannot under strict.
+# Overridable so the behaviour can be exercised without a systemd sandbox.
+RW_CANARY="${GUARDIAN_RW_CANARY:-/etc}"
+if [ -w "$RW_CANARY" ]; then
+    if ! touch "$DEST_BASE/.guardian-write-test" 2>/dev/null; then
+        echo "❌ Backup drive is not writable — mounted read-only, or the filesystem has faulted"
+        PROBLEMS=$((PROBLEMS + 1))
+    else
+        rm -f "$DEST_BASE/.guardian-write-test" 2>/dev/null || true
+    fi
 else
-    rm -f "$DEST_BASE/.guardian-write-test" 2>/dev/null || true
+    # Not a problem, and not silence either — say which check did not run.
+    echo "ℹ️ Writability not checked (running inside the bot's read-only sandbox)"
 fi
 
 DRIVE=$(df -Ph "$DEST_BASE" 2>/dev/null | awk 'NR==2{print $4" free of "$2}')

@@ -24,11 +24,11 @@
 # between is silent.
 #
 # The latch never decays, and reporting is driven by the union of what is live
-# now and what has ever been latched. That matters: `journalctl -b` only covers
-# the current boot, so a reboot drops the live count to zero while the drive is
-# every bit as sick as it was. Letting the alert clear itself there would be
-# worse than not alerting at all. Recovery is deliberate: --reset, after you
-# have actually replaced the hardware.
+# now and what has ever been latched. That matters because the journal window is
+# finite: errors age out, and a drive whose last recorded failure was eight days
+# ago is not a healthy drive. Letting the alert clear itself would be worse than
+# not alerting at all. Recovery is deliberate: --reset, after you have actually
+# replaced the hardware.
 
 set -uo pipefail
 
@@ -148,9 +148,14 @@ record() { LIVE["$1"]="${2:-1}"; }
 # Piped straight into awk. On a node throwing repeated I/O errors the journal is
 # large, and slurping it into a shell variable would balloon memory on a Pi for
 # no reason.
+# Window: recent history, NOT the current boot. `-b` looked tidy and was wrong —
+# a node that logged I/O errors yesterday and has since rebooted reports a clean
+# current boot while the card is exactly as damaged as it was. Time-bounding
+# keeps the read cheap without pretending a power cycle fixed the hardware.
+KERNEL_WINDOW="7 days ago"
 KERNEL_LOG_OK=0
 if [ "$IS_ROOT" -eq 1 ] && command -v journalctl &>/dev/null; then
-    KERNEL_SUMMARY=$(timeout "$JOURNAL_TIMEOUT" journalctl -k -b --no-pager 2>/dev/null | awk '
+    KERNEL_SUMMARY=$(timeout "$JOURNAL_TIMEOUT" journalctl -k --since "$KERNEL_WINDOW" --no-pager 2>/dev/null | awk '
         # "I/O error, dev mmcblk0, sector 30648088 op 0x0:(READ)"
         match($0, /I\/O error, dev [a-zA-Z0-9]+/) {
             d = substr($0, RSTART + 15, RLENGTH - 15); ioerr[d]++; next
