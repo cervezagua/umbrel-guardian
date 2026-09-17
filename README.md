@@ -91,6 +91,42 @@ If you miss the 30-second window, the confirmation expires and you have to start
 
 All four commands are blocked by `/lock` (you must `/unlock <PIN>` first). The sudoers entry at `/etc/sudoers.d/umbrel-guardian-system` allows *exactly* these five subcommands of `scripts/system_control.sh`, plus the two read-only diagnostics `disk_health.sh` and `verify_backup.sh` — nothing else — and is re-deployed on every boot by `reinstall-services.sh` (because `/etc/sudoers.d/` is wiped each boot).
 
+### Disk health, and why it remembers
+
+`/disk_health` reads the kernel journal **incrementally**. It stores a journal
+cursor in `.state/disk-health.cursor` and, on each run, asks only for what has
+been logged since the last one.
+
+That is not an optimisation detail. On a node with a 1.8 GB journal, re-scanning
+a time window measured at **75 seconds per run** — which would mean holding an
+SD card you already suspect of failing under continuous read load every 30
+minutes, in order to ask whether it is failing. (`journalctl --grep` does not
+help: it filters what is printed, not what is read, and measured identically.)
+
+Because each entry is counted once, error counts **accumulate** in
+`.state/disk-health.counts` and are reported as order-of-magnitude buckets
+(1+, 10+, 100+, 1000+) that are latched and never decay. A drive that threw
+errors last week is still that drive, so the alert does not clear itself when
+the journal goes quiet.
+
+To clear it after you have actually replaced the hardware:
+
+```bash
+sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --reset
+```
+
+This is deliberately SSH-only, not a bot command — swapping a card already
+requires physical access, and a state-destroying action does not belong on a
+chat interface. As well as clearing the latch, `--reset` **pins the cursor to
+that moment**, so the replacement drive starts from zero instead of inheriting
+its predecessor's errors on the next run.
+
+The first run after installing has no cursor, so it reads back through the tail
+of the journal to notice a card that is *already* failing. If even that cannot
+finish in time, Guardian says so, pins the cursor, and monitors forward from
+then on rather than retrying the same scan forever.
+
+
 ### `/restart` resolution
 
 The app id can be given in any of these forms:
@@ -136,7 +172,7 @@ umbrel-guardian/
 │   ├── system_control.sh       ← Privileged reboot/shutdown/restart wrapper (sudo)
 │   └── mount-backup.sh         ← Mount backup drive (udev + boot + safety net)
 │
-├── .state/                     ← Alert latches and seen-sets (gitignored, survives reboot)
+├── .state/                     ← Alert latches, seen-sets, journal cursor (gitignored, survives reboot)
 │
 ├── services/
 │   ├── umbrel-guardian-bot.service              ← Always-running bot
