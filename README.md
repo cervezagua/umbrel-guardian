@@ -129,8 +129,13 @@ live monitoring is unaffected. To pay that cost deliberately:
 sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --import-history
 ```
 
+It reads the whole journal, not just the tail — you asked for it and granted it
+the time.
+
 (A journal that cannot answer in 20 seconds is itself a symptom worth noticing.
-`sudo journalctl --vacuum-size=200M` is usually the fix.)
+`sudo journalctl --vacuum-size=200M` is usually the fix — but **import first,
+then vacuum**: vacuuming deletes the archived history the import would have
+read.)
 
 **After replacing a drive:**
 

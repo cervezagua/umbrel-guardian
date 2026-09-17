@@ -326,9 +326,18 @@ NEW_WATERMARK=""
 # forever. The outcome is recorded either way and never retried automatically —
 # the failure mode being avoided is a 30-minute timer that spends two minutes
 # every cycle re-discovering that the journal is unreadable.
+# $1 = time budget, $2 = line limit ("all" reads the whole journal).
+#
+# The automatic attempt is bounded on both axes because it must not cost a
+# slow node anything twice. An explicit --import-history is not: a human asked
+# for it, granted it ten minutes, and wants everything that is there. Reading
+# only the tail in that case quietly answers a narrower question than the one
+# being asked, and reports it as if it were the whole answer.
 import_history() {
-    local budget="$1" raw rc saved="${NEW_WATERMARK:-}"
-    raw=$(timeout "$budget" journalctl -k --no-pager -n "$BOOTSTRAP_LINES" 2>/dev/null | count_stream -1)
+    local budget="$1" limit="${2:-$BOOTSTRAP_LINES}" raw rc saved="${NEW_WATERMARK:-}"
+    local -a args=(-k --no-pager)
+    [ "$limit" = "all" ] || args+=(-n "$limit")
+    raw=$(timeout "$budget" journalctl "${args[@]}" 2>/dev/null | count_stream -1)
     rc=$?
     if [ "$rc" -ne 0 ]; then return "$rc"; fi
     absorb <<< "${raw:-}"
@@ -346,7 +355,7 @@ if [ "$MODE" = "import" ]; then
         echo "⚠️ --import-history needs root: sudo $0 --import-history" >&2; exit 1
     fi
     echo "Reading kernel log history from journald (up to ${JOURNAL_IMPORT_TIMEOUT}s)…"
-    if import_history "$JOURNAL_IMPORT_TIMEOUT"; then
+    if import_history "$JOURNAL_IMPORT_TIMEOUT" all; then
         persist_counts && echo "imported" > "$HISTORY_FILE" 2>/dev/null
         echo "✅ History imported. Run $0 to see the result."
     else
