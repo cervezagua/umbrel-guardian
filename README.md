@@ -66,18 +66,18 @@ If a previous `config.env` exists, the installer asks before overwriting it — 
 | `/logs <app_id> [n]` | 📋 Last N lines of an app's container logs (default: 50) |
 | `/backup` | ⏳ Trigger a manual backup immediately |
 | `/verify_backup` | 🔍 Check the backup is actually restorable (add `deep` for a full file-by-file compare) |
-| `/disk_health` | 🩺 SMART attributes, SD/eMMC wear, and kernel I/O errors |
+| `/disk_health` | 🩺 Kernel I/O errors, SMART attributes, SD/eMMC wear (alias: `/disks`) |
 | `/storage` | 💾 Per-app storage usage |
 | `/notifications` | 🔔 Pending umbrelOS notifications |
 | `/updates` | 🔄 umbrelOS version, release channel, and available updates |
 | `/system_reboot` | 🔄 Reboot the Pi (2-step confirm; +60s grace) |
 | `/system_shutdown` | ⏻ Power off the Pi (2-step confirm; needs physical access to restart) |
 | `/restart_docker` | 🔄 Restart Docker daemon (2-step confirm; briefly interrupts all containers) |
-| `/restart_umbrel` | 🔄 Restart umbreld (2-step confirm; brief web UI outage) |
+| `/restart_umbrel` | 🔄 Restart umbreld (2-step confirm; brief web UI outage — also clears apps stuck in a transient state, see below) |
 | `/system_cancel` | ⛔ Cancel a pending reboot or shutdown (within the +60s grace window) |
 | `/lock` | 🔒 Enable safe mode — disables dangerous commands |
 | `/unlock <PIN>` | 🔓 Disable safe mode |
-| `/help` | ❓ Show available commands |
+| `/help` | ❓ Show available commands (alias: `/start`) |
 
 ### System control commands
 
@@ -90,6 +90,30 @@ If a previous `config.env` exists, the installer asks before overwriting it — 
 If you miss the 30-second window, the confirmation expires and you have to start over. For reboot/shutdown there's an additional **60-second grace period** after confirmation during which `/system_cancel` aborts the operation.
 
 All four commands are blocked by `/lock` (you must `/unlock <PIN>` first). The sudoers entry at `/etc/sudoers.d/umbrel-guardian-system` allows *exactly* these five subcommands of `scripts/system_control.sh`, plus the two read-only diagnostics `disk_health.sh` and `verify_backup.sh` — nothing else — and is re-deployed on every boot by `reinstall-services.sh` (because `/etc/sudoers.d/` is wiped each boot).
+
+### When an app is stuck "restarting" forever
+
+umbrelOS keeps each app's lifecycle state **in memory only** — it is a field on
+the running `umbreld` process, never written to disk. The lifecycle scripts it
+runs (`docker compose stop` / `up`) are invoked with **no timeout**, and the
+state is cleared only when that command finishes or throws. So if Docker wedges
+— which a failing disk will cause — the promise never settles, the state stays
+`restarting`, and nothing reconciles it. The dashboard shows a spinner
+indefinitely for an operation that is no longer happening.
+
+Two consequences worth knowing:
+
+- **Retrying makes it worse.** umbreld's `restart` does not reject a request for
+  an app already in `restarting`, so each attempt launches another lifecycle
+  command that queues behind the wedged one.
+- **`/restart_umbrel` clears it.** Because the state was never persisted, every
+  app is reconstructed as `unknown` when umbreld starts and then auto-started.
+
+If the apps do not come back after that, the containers themselves are failing
+to start and `/logs <app_id>` will say why. On a node with disk errors, check
+whether the app's `docker-compose.yml` still parses — umbreld rewrites that file
+on every start, so it is the file most likely to be caught mid-write by a
+stalling drive.
 
 ### Disk health, and why it reads the ring buffer
 
