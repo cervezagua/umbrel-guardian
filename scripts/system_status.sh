@@ -28,7 +28,7 @@ UPTIME_STR=$(uptime -p 2>/dev/null || uptime)
 # App count (non-fatal if umbreld is unavailable)
 APP_COUNT="?"
 if command -v umbreld &>/dev/null; then
-    _RAW=$(timeout 10 umbreld client apps.list.query 2>&1) || true
+    _RAW=$(timeout 45 umbreld client apps.list.query 2>&1) || true
     APP_COUNT=$(echo "$_RAW" | python3 -c "
 import sys, json
 raw = sys.stdin.read()

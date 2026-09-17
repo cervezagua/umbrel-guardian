@@ -20,6 +20,13 @@ PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=/home/umbrel/umbrel/umbrel-guardian
 MemoryMax=128M
+# CPUQuota applies to the whole cgroup — the bot AND every process it spawns.
+# `umbreld client` is Node and burns ~2.7s of CPU per query, so under this quota
+# it takes ~19s wall instead of ~1.8s. Measured on a live node. Any timeout on an
+# umbreld call from the bot has to budget for that multiplier; scripts use 45s
+# and the bot allows 90s for the commands that make such a call. The limit stays
+# because a runaway bot must not be able to starve a Bitcoin node — the answer is
+# realistic timeouts, not a weaker sandbox.
 CPUQuota=20%
 # NOTE: NoNewPrivileges is intentionally NOT set — the bot uses `sudo -n` to
 # invoke scripts/system_control.sh for /system_reboot, /system_shutdown,

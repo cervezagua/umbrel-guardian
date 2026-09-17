@@ -39,7 +39,13 @@ MODE="send"
 
 # Overridable so the test harness can drive this without a live umbreld.
 UMBRELD_BIN="${UMBRELD_BIN:-umbreld}"
-UMBRELD_TIMEOUT=10
+# 45s, not the 10s that looks generous for a local query. `umbreld client` is
+# Node and burns ~2.7s of CPU to answer; the bot's unit sets CPUQuota=20%, and
+# cgroup limits apply to every process the bot spawns. Measured on a live node:
+# 1.8s unconstrained, 19.25s under that quota — a 10x multiplier. A 10s timeout
+# is therefore guaranteed to fail from the bot while passing every test run from
+# a shell, which is exactly how this shipped.
+UMBRELD_TIMEOUT=45
 MAX_MESSAGES=5
 
 command -v "$UMBRELD_BIN" &>/dev/null || {

@@ -71,7 +71,7 @@ if command -v umbreld &>/dev/null; then
     # The heredoc stays (this script needs both quote styles internally, so
     # collapsing it into python3 -c would be a quoting minefield); only the data
     # path moves.
-    APP_RAW=$(timeout 10 umbreld client apps.list.query 2>&1)
+    APP_RAW=$(timeout 45 umbreld client apps.list.query 2>&1)
     APP_ISSUES=$(APP_RAW="$APP_RAW" python3 - <<'PYEOF'
 import os, json
 
