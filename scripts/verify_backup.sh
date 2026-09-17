@@ -30,6 +30,14 @@ DEEP_UNIT="umbrel-guardian-verify-deep"
 
 # shellcheck source=/dev/null
 [ -f "$CONFIG" ] && source "$CONFIG"
+# Same contract as backup.sh: without the shared scope definition this script
+# cannot tell real drift from excluded paths, so it must not pretend to.
+if [ ! -r "$SCRIPT_DIR/lib-backup-scope.sh" ]; then
+    echo "❌ scripts/lib-backup-scope.sh is missing — Guardian looks partially deployed."
+    echo "   Cannot verify the backup without knowing what is in scope."
+    echo "   Re-deploy: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh"
+    exit 1
+fi
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib-backup-scope.sh"
 

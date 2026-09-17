@@ -19,8 +19,31 @@ SEND="$SCRIPT_DIR/telegram_send.sh"
 # shellcheck source=/dev/null
 source "$CONFIG"
 # Shared with verify_backup.sh — defines what is in scope and what is excluded.
+#
+# Hard-fail if it is missing. Without it the exclude list comes out EMPTY and the
+# clone happily copies external/ — the backup drive umbrelOS may have mounted
+# inside the source — into itself, while still reporting "Backup complete". A
+# partial deploy is exactly how that happens, and a backup that looks successful
+# and is not is worse than one that refuses to run.
+if [ ! -r "$SCRIPT_DIR/lib-backup-scope.sh" ]; then
+    "$SEND" "⚠️ Backup ABORTED: scripts/lib-backup-scope.sh is missing or unreadable.
+It defines which paths are excluded — without it the clone could copy the backup
+drive into itself. Guardian looks partially deployed.
+Re-deploy: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh"
+    exit 1
+fi
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib-backup-scope.sh"
+
+# A truncated or half-written file sources without error but defines nothing,
+# which fails the same silent way. Assert the contract, not just the file.
+for _fn in guardian_full_clone_excludes guardian_db_excludes guardian_as_rsync_args; do
+    if ! declare -F "$_fn" >/dev/null 2>&1; then
+        "$SEND" "⚠️ Backup ABORTED: lib-backup-scope.sh loaded but $_fn is undefined.
+The file looks truncated or corrupt. Re-deploy Guardian before backing up again."
+        exit 1
+    fi
+done
 
 # Remove trigger file so the systemd .path unit resets for the next manual /backup
 rm -f "$(dirname "$SCRIPT_DIR")/.backup-trigger" 2>/dev/null || true
