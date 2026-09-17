@@ -91,25 +91,48 @@ If you miss the 30-second window, the confirmation expires and you have to start
 
 All four commands are blocked by `/lock` (you must `/unlock <PIN>` first). The sudoers entry at `/etc/sudoers.d/umbrel-guardian-system` allows *exactly* these five subcommands of `scripts/system_control.sh`, plus the two read-only diagnostics `disk_health.sh` and `verify_backup.sh` — nothing else — and is re-deployed on every boot by `reinstall-services.sh` (because `/etc/sudoers.d/` is wiped each boot).
 
-### Disk health, and why it remembers
+### Disk health, and why it reads the ring buffer
 
-`/disk_health` reads the kernel journal **incrementally**. It stores a journal
-cursor in `.state/disk-health.cursor` and, on each run, asks only for what has
-been logged since the last one.
+`/disk_health` reads the **kernel ring buffer** (`dmesg`), not journald. That is
+a correctness decision, not a performance one.
 
-That is not an optimisation detail. On a node with a 1.8 GB journal, re-scanning
-a time window measured at **75 seconds per run** — which would mean holding an
-SD card you already suspect of failing under continuous read load every 30
-minutes, in order to ask whether it is failing. (`journalctl --grep` does not
-help: it filters what is printed, not what is read, and measured identically.)
+journald's logs live on the disk being monitored, so a failing disk makes the
+monitor slow — the tool degrades exactly when the thing it watches gets worse,
+which is the one moment it has to work. Measured on a live node with 1.8 GB of
+journal on an SD card throwing I/O errors:
 
-Because each entry is counted once, error counts **accumulate** in
-`.state/disk-health.counts` and are reported as order-of-magnitude buckets
-(1+, 10+, 100+, 1000+) that are latched and never decay. A drive that threw
-errors last week is still that drive, so the alert does not clear itself when
-the journal goes quiet.
+| query | time |
+|---|---|
+| `journalctl -k --since "7 days ago"` | 75 s |
+| the same with `--grep` (17 lines instead of 4125) | 75 s |
+| `journalctl -k -n 1` — just asking where the journal *ends* | **over 60 s** |
 
-To clear it after you have actually replaced the hardware:
+The ring buffer is in RAM. It costs nothing and cannot be slowed down by a dying
+card. On an idle node it holds far more than the 30 minutes between checks.
+
+What it does not hold is history from before the current boot — and that is what
+`.state/` is for. Counts accumulate in `.state/disk-health.counts`, deduplicated
+by a monotonic-clock watermark in `.state/disk-health.dmesg` so the same buffer
+is never counted twice, and the latch persists across reboots even though the
+buffer does not. What Guardian observes once, it remembers for good.
+
+Counts are reported as order-of-magnitude buckets (1+, 10+, 100+, 1000+) that
+never decay. A drive that threw errors last week is still that drive, so the
+alert does not clear itself when the buffer goes quiet.
+
+**Pre-install history.** On its first run Guardian makes one short (20 s) attempt
+to read older errors out of journald, records the outcome, and never retries
+automatically. If your journal is too slow to answer, the report says so and
+live monitoring is unaffected. To pay that cost deliberately:
+
+```bash
+sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --import-history
+```
+
+(A journal that cannot answer in 20 seconds is itself a symptom worth noticing.
+`sudo journalctl --vacuum-size=200M` is usually the fix.)
+
+**After replacing a drive:**
 
 ```bash
 sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --reset
@@ -117,15 +140,11 @@ sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --reset
 
 This is deliberately SSH-only, not a bot command — swapping a card already
 requires physical access, and a state-destroying action does not belong on a
-chat interface. As well as clearing the latch, `--reset` **pins the cursor to
+chat interface. As well as clearing the latch, `--reset` **pins the watermark to
 that moment**, so the replacement drive starts from zero instead of inheriting
-its predecessor's errors on the next run.
-
-The first run after installing has no cursor, so it reads back through the tail
-of the journal to notice a card that is *already* failing. If even that cannot
-finish in time, Guardian says so, pins the cursor, and monitors forward from
-then on rather than retrying the same scan forever.
-
+its predecessor's errors from whatever is still sitting in the buffer. It reads
+only the ring buffer, so it works on a node whose journal is unusable — which is
+exactly the node you are most likely to be replacing a card on.
 
 ### `/restart` resolution
 
@@ -172,7 +191,7 @@ umbrel-guardian/
 │   ├── system_control.sh       ← Privileged reboot/shutdown/restart wrapper (sudo)
 │   └── mount-backup.sh         ← Mount backup drive (udev + boot + safety net)
 │
-├── .state/                     ← Alert latches, seen-sets, journal cursor (gitignored, survives reboot)
+├── .state/                     ← Alert latches, seen-sets, dmesg watermark (gitignored, survives reboot)
 │
 ├── services/
 │   ├── umbrel-guardian-bot.service              ← Always-running bot

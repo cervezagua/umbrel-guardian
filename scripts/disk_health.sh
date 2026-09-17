@@ -59,17 +59,19 @@ CONFIG="$(dirname "$SCRIPT_DIR")/config.env"
 STATE_DIR="$(dirname "$SCRIPT_DIR")/.state"
 STATE_FILE="$STATE_DIR/disk-health.state"
 COUNT_FILE="$STATE_DIR/disk-health.counts"
-CURSOR_FILE="$STATE_DIR/disk-health.cursor"
+DMESG_FILE="$STATE_DIR/disk-health.dmesg"
+HISTORY_FILE="$STATE_DIR/disk-health.history"
 
 # shellcheck source=/dev/null
 [ -f "$CONFIG" ] && source "$CONFIG"
 
 MODE="report"
 case "${1:-}" in
-    --issues) MODE="issues" ;;
-    --reset)  MODE="reset" ;;
-    "")       ;;
-    *)        echo "Usage: $0 [--issues|--reset]" >&2; exit 2 ;;
+    --issues)          MODE="issues" ;;
+    --reset)           MODE="reset" ;;
+    --import-history)  MODE="import" ;;
+    "")                ;;
+    *)        echo "Usage: $0 [--issues|--reset|--import-history]" >&2; exit 2 ;;
 esac
 
 # Sub-probe timeouts. A wedged drive must not hold the health timer open: the
@@ -81,12 +83,12 @@ SMART_TIMEOUT=20
 # 10s budget on a full-window scan silently produced "no errors found" on a node
 # whose journal contained four I/O errors — see the failure handling below,
 # which is the part that made that silent rather than obvious.
-JOURNAL_TIMEOUT=60
-# How far back the FIRST run looks, in kernel log lines. Seeking to the tail and
-# walking backwards is cheap; seeking to a timestamp and reading forward is the
-# 75-second operation. Kernel messages are sparse on an idle node, so a couple of
-# thousand lines typically reach back months — far enough to notice a card that
-# is already failing when Guardian is installed.
+DMESG_TIMEOUT=15
+# The one-off attempt at journald history gets a SHORT budget, because on a node
+# whose journal is slow it will never succeed and must not be paid for twice.
+# The explicit --import-history gets a long one, because then a human asked.
+JOURNAL_BOOTSTRAP_TIMEOUT=20
+JOURNAL_IMPORT_TIMEOUT=600
 BOOTSTRAP_LINES="${DISK_HEALTH_BOOTSTRAP_LINES:-2000}"
 
 say() { [ "$MODE" = "report" ] && echo "$1"; return 0; }
@@ -105,31 +107,38 @@ fi
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
 # ── --reset ──────────────────────────────────────────────────────────────────
-# Clearing the latch is not enough. If the cursor were simply deleted, the next
-# run would bootstrap from the tail and re-import the very errors you just
-# replaced the hardware to get rid of, re-latching them within 30 minutes. So
-# --reset PINS the cursor to now: tracking restarts from this moment, which is
-# what "I have swapped the card" actually means.
-# The cheapest question you can ask a journal: where does it currently end?
-# One entry, no content, no scan — used both by --reset and as the escape hatch
-# when a bootstrap proves too expensive to finish.
-pin_cursor_to_now() {
-    local pin
-    pin=$(timeout "$JOURNAL_TIMEOUT" journalctl -k -n 1 --no-pager --show-cursor 2>/dev/null \
-          | sed -n 's/^-- cursor: //p' | tail -n1)
-    [ -n "${pin:-}" ] || return 1
-    printf '%s\n' "$pin" > "$CURSOR_FILE" 2>/dev/null || return 1
+# Clearing the latch is not enough. If the watermark were simply deleted, the
+# next run would count everything still sitting in the ring buffer and re-latch
+# the very errors you just replaced the hardware to get rid of. So --reset PINS
+# the watermark to now: counting restarts from this moment, which is what "I
+# have swapped the card" actually means.
+#
+# This reads the ring buffer, never journald. --reset must work on a node whose
+# journal is unusable — that is precisely the node you are most likely to be
+# replacing a card on.
+dmesg_max_timestamp() {
+    timeout "$DMESG_TIMEOUT" dmesg -k 2>/dev/null \
+        | awk 'match($0, /^\[[ ]*[0-9.]+\]/) { t = substr($0, 2, RLENGTH - 2) + 0; if (t > m) m = t }
+               END { printf "%.6f\n", m + 0 }'
+}
+
+pin_dmesg_watermark() {
+    local wm
+    wm=$(dmesg_max_timestamp)
+    [[ "${wm:-}" =~ ^[0-9.]+$ ]] || return 1
+    { echo "bootid=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+      echo "watermark=$wm"; } > "$DMESG_FILE" 2>/dev/null || return 1
     return 0
 }
 
 if [ "$MODE" = "reset" ]; then
-    rm -f "$STATE_FILE" "$COUNT_FILE" "$CURSOR_FILE"
-    if pin_cursor_to_now; then
-        echo "✅ Disk health latches cleared. Kernel-log tracking restarts from now."
+    rm -f "$STATE_FILE" "$COUNT_FILE" "$DMESG_FILE"
+    if pin_dmesg_watermark; then
+        echo "✅ Disk health latches cleared. Kernel-log counting restarts from now."
     else
         echo "✅ Disk health latches cleared."
-        echo "ℹ️ Could not pin the journal position (need root, or journalctl is unavailable)."
-        echo "   The next run will re-read recent history, which may re-latch old errors."
+        echo "ℹ️ Could not read the kernel ring buffer (need root?)."
+        echo "   The next run will count what is already in it, which may re-latch old errors."
     fi
     exit 0
 fi
@@ -210,21 +219,34 @@ declare -A LIVE=()
 record() { LIVE["$1"]="${2:-1}"; }
 
 # ── Kernel log probe ─────────────────────────────────────────────────────────
-# Piped straight into awk. Even an incremental read can return a burst of lines
-# from a drive that is actively failing, and slurping that into a shell variable
-# would balloon memory on a Pi for no reason.
+# Source of truth: the kernel ring buffer, via dmesg. NOT journald.
 #
-# The window is NOT the current boot. `-b` looked tidy and was wrong — a node
-# that logged I/O errors yesterday and has since rebooted reports a clean
-# current boot while the card is exactly as damaged as it was. The cursor spans
-# reboots, so history survives a power cycle the way the hardware does.
+# That is a correctness decision, not a performance one. journald's logs live on
+# the disk being monitored, so a failing disk makes the monitor slow — the tool
+# degrades exactly when the thing it watches gets worse, which is the one moment
+# it has to work. Measured on the live node, with 1.8 GB of journal on an SD card
+# throwing I/O errors:
+#
+#   journalctl -k --since "7 days ago"    75 s   (--grep does not help: it
+#   journalctl -k --grep ... --since ...  75 s    filters output, not reads)
+#   journalctl -k -n 1                   >60 s   ← even asking where it ENDS
+#
+# That last one is why the previous design failed in the field: its escape hatch
+# for a slow journal was itself a journald call, so a run cost two full timeouts
+# and never converged. Any fallback that lands back on the broken dependency is
+# not a fallback.
+#
+# The ring buffer is in RAM. It costs nothing, it cannot be slowed down by a
+# dying card, and on an idle node it holds far more than the 30 minutes between
+# checks. What it does not hold is history from before the current boot — and
+# that is what .state/ is for: the latch persists across reboots even though the
+# buffer does not, so what we observe once we remember for good.
 KERNEL_LOG_OK=0
 declare -A DELTA=()
-NEW_CURSOR=""
 
-# Counts accumulated by every previous run. These are what get bucketed; a
-# single incremental read only ever sees the last half hour, which would never
-# reach a meaningful bucket on its own.
+# Counts accumulated by every previous run. These are what get bucketed; one
+# read only ever sees what is new, which would never reach a meaningful bucket
+# on its own.
 declare -A TOTAL=()
 if [ -f "$COUNT_FILE" ]; then
     while IFS='=' read -r _k _v; do
@@ -234,12 +256,19 @@ if [ -f "$COUNT_FILE" ]; then
     done < "$COUNT_FILE"
 fi
 
-kernel_scan() {
-    timeout "$JOURNAL_TIMEOUT" journalctl -k --no-pager --show-cursor "$@" 2>/dev/null | awk '
-        # journalctl appends this as its final line under --show-cursor. Capture
-        # it here rather than post-processing the stream, so the whole read stays
-        # a single pass with nothing buffered.
-        /^-- cursor: / { cursor = substr($0, 12); next }
+# One counting pass, shared by both sources. `wm` is a monotonic-clock
+# watermark: lines at or below it were counted by an earlier run. dmesg stamps
+# every line "[  123.456789]"; journalctl does not, so for a history import the
+# timestamp rule simply never fires and everything is counted once.
+count_stream() {
+    awk -v wm="${1:--1}" '
+        {
+            if (match($0, /^\[[ ]*[0-9.]+\]/)) {
+                t = substr($0, 2, RLENGTH - 2) + 0
+                if (t > maxts) maxts = t
+                if (t <= wm) next
+            }
+        }
         # "I/O error, dev mmcblk0, sector 30648088 op 0x0:(READ)"
         match($0, /I\/O error, dev [a-zA-Z0-9]+/) {
             d = substr($0, RSTART + 15, RLENGTH - 15); ioerr[d]++; next
@@ -250,7 +279,7 @@ kernel_scan() {
         }
         /critical medium error|Medium Error|Unrecovered read error/ { medium++; next }
         # "usb 2-1: reset SuperSpeed USB device number 3". Extract from the match,
-        # never by splitting on ":" — the syslog timestamp is full of colons.
+        # never by splitting on ":" — the timestamp is full of colons.
         /: reset (high-speed|full-speed|low-speed|SuperSpeed)/ {
             if (match($0, /usb [0-9]+-[0-9.]+/)) {
                 d = substr($0, RSTART + 4, RLENGTH - 4); usbreset[d]++; next
@@ -262,87 +291,116 @@ kernel_scan() {
             for (d in usbreset) print "usbreset:" d " " usbreset[d]
             if (medium + 0 > 0) print "medium " (medium + 0)
             if (ro + 0 > 0)     print "readonly " (ro + 0)
-            if (cursor != "")   print "__cursor__ " cursor
+            if (maxts + 0 > 0)  printf "__watermark__ %.6f\n", maxts
         }
     '
 }
 
-if [ "$IS_ROOT" -eq 1 ] && command -v journalctl &>/dev/null; then
-    CURSOR=""
-    [ -f "$CURSOR_FILE" ] && CURSOR=$(head -n1 "$CURSOR_FILE" 2>/dev/null || true)
+absorb() {   # stdin: "key count" lines → DELTA + TOTAL, and the new watermark
+    local key count
+    while read -r key count; do
+        [ -n "${key:-}" ] || continue
+        if [ "$key" = "__watermark__" ]; then NEW_WATERMARK="${count:-}"; continue; fi
+        DELTA["$key"]=$(( ${DELTA["$key"]:-0} + ${count:-1} ))
+        TOTAL["$key"]=$(( ${TOTAL["$key"]:-0} + ${count:-1} ))
+    done
+}
 
-    KERNEL_RC=0
-    if [ -n "${CURSOR:-}" ]; then
-        KERNEL_SUMMARY=$(kernel_scan --after-cursor "$CURSOR"); KERNEL_RC=$?
-        # A cursor whose entry has since been vacuumed away is not a monitoring
-        # failure, it is an expired bookmark. Fall back to a bootstrap rather
-        # than reporting the disks as unmonitored. A timeout is NOT this case —
-        # retrying it would just burn the budget twice.
-        if [ "$KERNEL_RC" -ne 0 ] && [ "$KERNEL_RC" -ne 124 ]; then
-            CURSOR=""
+persist_counts() {
+    local tmp="${COUNT_FILE}.tmp.$$" k
+    [ -n "${TOTAL[*]:-}" ] || return 0
+    : > "$tmp" 2>/dev/null || return 1
+    for k in ${TOTAL[@]+"${!TOTAL[@]}"}; do
+        printf '%s=%s\n' "$k" "${TOTAL[$k]}" >> "$tmp"
+    done
+    mv -f "$tmp" "$COUNT_FILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+NEW_WATERMARK=""
+
+# ── One-off journald history import ──────────────────────────────────────────
+# Worth trying once: a card can already be failing when Guardian is installed,
+# and that evidence lives in journald across previous boots. Worth trying only
+# ONCE, and on a short leash, because on a node where it is slow it will be slow
+# forever. The outcome is recorded either way and never retried automatically —
+# the failure mode being avoided is a 30-minute timer that spends two minutes
+# every cycle re-discovering that the journal is unreadable.
+import_history() {
+    local budget="$1" raw rc saved="${NEW_WATERMARK:-}"
+    raw=$(timeout "$budget" journalctl -k --no-pager -n "$BOOTSTRAP_LINES" 2>/dev/null | count_stream -1)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then return "$rc"; fi
+    absorb <<< "${raw:-}"
+    # journald lines carry no ring-buffer clock, so this import must not disturb
+    # the watermark the dmesg read just established. Restoring it explicitly
+    # rather than trusting that journalctl never emits a "[123.456]" prefix:
+    # getting that wrong silently makes the ring buffer re-count itself forever,
+    # which is how this was caught.
+    NEW_WATERMARK="$saved"
+    return 0
+}
+
+if [ "$MODE" = "import" ]; then
+    if [ "$IS_ROOT" -eq 0 ]; then
+        echo "⚠️ --import-history needs root: sudo $0 --import-history" >&2; exit 1
+    fi
+    echo "Reading kernel log history from journald (up to ${JOURNAL_IMPORT_TIMEOUT}s)…"
+    if import_history "$JOURNAL_IMPORT_TIMEOUT"; then
+        persist_counts && echo "imported" > "$HISTORY_FILE" 2>/dev/null
+        echo "✅ History imported. Run $0 to see the result."
+    else
+        echo "skipped:timeout" > "$HISTORY_FILE" 2>/dev/null
+        echo "❌ journald did not answer within ${JOURNAL_IMPORT_TIMEOUT}s."
+        echo "   Your journal is ${JOURNAL_IMPORT_TIMEOUT}s-unreadable, which on a node with"
+        echo "   disk errors is itself a symptom. Consider: sudo journalctl --vacuum-size=200M"
+    fi
+    exit 0
+fi
+
+if [ "$IS_ROOT" -eq 1 ] && command -v dmesg &>/dev/null; then
+    # Same boot → resume from the watermark. Different boot (or none recorded) →
+    # the buffer was rebuilt from scratch, so everything in it is new.
+    WATERMARK=-1
+    BOOT_NOW=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+    if [ -f "$DMESG_FILE" ]; then
+        BOOT_WAS=$(awk -F= '$1=="bootid"{print $2; exit}' "$DMESG_FILE" 2>/dev/null)
+        if [ "${BOOT_WAS:-}" = "$BOOT_NOW" ]; then
+            _w=$(awk -F= '$1=="watermark"{print $2; exit}' "$DMESG_FILE" 2>/dev/null)
+            [[ "${_w:-}" =~ ^[0-9.]+$ ]] && WATERMARK="$_w"
         fi
     fi
-    if [ -z "${CURSOR:-}" ]; then
-        KERNEL_SUMMARY=$(kernel_scan -n "$BOOTSTRAP_LINES"); KERNEL_RC=$?
-        # If even the tail read cannot finish, do NOT just report a failure and
-        # try again in 30 minutes — with no cursor to advance, that repeats
-        # forever and is the very "scan the whole journal on every cycle"
-        # behaviour this design exists to remove. Give up on the backlog, pin
-        # the cursor here, and monitor forward from now. Partial monitoring
-        # that works beats complete monitoring that never completes; saying so
-        # out loud is what keeps it from being a silent all-clear.
-        if [ "$KERNEL_RC" -ne 0 ] && pin_cursor_to_now; then
-            BOOTSTRAP_GAVE_UP=1
-        fi
-    fi
 
-    # Check whether the probe actually SUCCEEDED. This was previously set to 1
-    # unconditionally, which meant a timed-out journal read was indistinguishable
-    # from a healthy disk: empty output, nothing recorded, and a confident
-    # "No disk problems detected" on a node that had logged I/O errors.
-    #
-    # A monitoring tool reporting all-clear because its probe failed is worse
-    # than one that crashes — you would believe it. Never infer health from the
-    # absence of evidence you failed to collect.
-    if [ "$KERNEL_RC" -eq 0 ]; then
+    DMESG_OUT=$(timeout "$DMESG_TIMEOUT" dmesg -k 2>/dev/null | count_stream "$WATERMARK")
+    DMESG_RC=$?
+    if [ "$DMESG_RC" -eq 0 ]; then
         KERNEL_LOG_OK=1
-        if [ -n "${KERNEL_SUMMARY:-}" ]; then
-            while read -r key count; do
-                [ -n "${key:-}" ] || continue
-                if [ "$key" = "__cursor__" ]; then NEW_CURSOR="${count:-}"; continue; fi
-                DELTA["$key"]="${count:-1}"
-                TOTAL["$key"]=$(( ${TOTAL["$key"]:-0} + ${count:-1} ))
-            done <<< "$KERNEL_SUMMARY"
-        fi
+        absorb <<< "${DMESG_OUT:-}"
 
-        # Persist the totals BEFORE advancing the cursor. Getting that order
-        # wrong would drop a run's findings on the floor every time the state
-        # directory was briefly unwritable: the cursor would say those entries
-        # were already accounted for, and nothing would ever count them.
-        COUNTS_SAVED=0
-        if [ -n "${TOTAL[*]:-}" ]; then
-            _tmp="${COUNT_FILE}.tmp.$$"
-            if : > "$_tmp" 2>/dev/null; then
-                for _k in ${TOTAL[@]+"${!TOTAL[@]}"}; do
-                    printf '%s=%s\n' "$_k" "${TOTAL[$_k]}" >> "$_tmp"
-                done
-                mv -f "$_tmp" "$COUNT_FILE" 2>/dev/null && COUNTS_SAVED=1 || rm -f "$_tmp"
+        # On the very first run, also try journald once for pre-install history.
+        if [ ! -f "$HISTORY_FILE" ] && command -v journalctl &>/dev/null; then
+            if import_history "$JOURNAL_BOOTSTRAP_TIMEOUT"; then
+                echo "imported" > "$HISTORY_FILE" 2>/dev/null
+            else
+                echo "skipped:timeout" > "$HISTORY_FILE" 2>/dev/null
+                HISTORY_SKIPPED=1
             fi
-        else
-            COUNTS_SAVED=1   # nothing to save is saved
         fi
-        if [ -n "${NEW_CURSOR:-}" ] && [ "$COUNTS_SAVED" -eq 1 ]; then
-            _tmp="${CURSOR_FILE}.tmp.$$"
-            printf '%s\n' "$NEW_CURSOR" > "$_tmp" 2>/dev/null \
-                && mv -f "$_tmp" "$CURSOR_FILE" 2>/dev/null || rm -f "$_tmp"
+        [ "$(cat "$HISTORY_FILE" 2>/dev/null)" = "skipped:timeout" ] && HISTORY_SKIPPED=1
+
+        # Counts first, watermark second. The other order drops a run's findings
+        # whenever the state directory is briefly unwritable: the watermark would
+        # say those lines were already accounted for, and nothing would count them.
+        if persist_counts && [[ "${NEW_WATERMARK:-}" =~ ^[0-9.]+$ ]]; then
+            { echo "bootid=$BOOT_NOW"; echo "watermark=$NEW_WATERMARK"; } \
+                > "$DMESG_FILE" 2>/dev/null || true
         fi
     else
-        # Surfaced as a real issue, not a footnote. The text is fixed, so it
-        # alerts once rather than every 30 minutes, and it says plainly that
-        # disk monitoring is currently blind rather than that the disks are fine.
-        KERNEL_PROBE_ERROR=$([ "$KERNEL_RC" -eq 124 ] \
-            && echo "timed out after ${JOURNAL_TIMEOUT}s" \
-            || echo "failed (exit $KERNEL_RC)")
+        # Never inferred as health. A monitoring tool reporting all-clear because
+        # its probe failed is worse than one that crashes — you would believe it.
+        KERNEL_PROBE_ERROR=$([ "$DMESG_RC" -eq 124 ] \
+            && echo "timed out after ${DMESG_TIMEOUT}s" \
+            || echo "failed (exit $DMESG_RC)")
     fi
 fi
 
@@ -441,13 +499,9 @@ PROBLEMS=0
 
 # Blindness is reported before findings, because it changes what the findings
 # mean: "no problems detected" is only reassuring if the detector ran.
-if [ -n "${BOOTSTRAP_GAVE_UP:-}" ]; then
+if [ -n "${KERNEL_PROBE_ERROR:-}" ]; then
     PROBLEMS=$((PROBLEMS + 1))
-    LINE="⚠️ Could not read existing kernel log history (the journal is too large to scan in ${JOURNAL_TIMEOUT}s). Disk monitoring is live from now on, but anything logged before this moment was not counted."
-    if [ "$MODE" = "issues" ]; then echo "$LINE"; else say "  $LINE"; fi
-elif [ -n "${KERNEL_PROBE_ERROR:-}" ]; then
-    PROBLEMS=$((PROBLEMS + 1))
-    LINE="⚠️ Disk monitoring is degraded — the kernel log probe ${KERNEL_PROBE_ERROR}. Disk errors would not be seen."
+    LINE="⚠️ Disk monitoring is degraded — the kernel ring buffer ${KERNEL_PROBE_ERROR}. Disk errors would not be seen."
     if [ "$MODE" = "issues" ]; then echo "$LINE"; else say "  $LINE"; fi
 fi
 
@@ -499,11 +553,17 @@ if [ "$MODE" = "report" ]; then
         say "     The bot invokes this via sudo -n. If that is failing, the sudoers"
         say "     file may be missing: sudo bash reinstall-services.sh"
     else
-        # Suppressed when we gave up on the backlog on purpose: that case has
-        # already said its piece above, and "could not read the kernel journal"
-        # would contradict the "monitoring is live from now on" it just printed.
-        [ "$KERNEL_LOG_OK" -eq 1 ] || [ -n "${BOOTSTRAP_GAVE_UP:-}" ] \
-            || say "  ⚠️ Could not read the kernel journal"
+        [ "$KERNEL_LOG_OK" -eq 1 ] || say "  ⚠️ Could not read the kernel ring buffer"
+        # Deliberately NOT an --issues line. Live monitoring is working; only
+        # pre-install history is missing. Alerting on it would put a permanent
+        # "something is wrong" in Telegram for a gap that cannot be closed by
+        # anything happening now.
+        if [ -n "${HISTORY_SKIPPED:-}" ]; then
+            say "  ℹ️ Kernel log history from before this boot was not imported —"
+            say "     journald did not answer in ${JOURNAL_BOOTSTRAP_TIMEOUT}s. Monitoring from"
+            say "     the ring buffer is unaffected. To retry the import:"
+            say "       sudo $SCRIPT_DIR/disk_health.sh --import-history"
+        fi
         if [ "$SMART_AVAILABLE" -eq 0 ]; then
             # Never an --issues line: a missing optional tool is not a failing
             # disk, and it would latch as a permanent alert. Guardian installs
