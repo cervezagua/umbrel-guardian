@@ -93,20 +93,32 @@ if [ "$MODE" = "deep-start" ]; then
         echo "⚠️ The deep scan needs root. The bot invokes it via sudo -n."
         exit 1
     fi
-    if systemctl is-active --quiet "$DEEP_UNIT" 2>/dev/null; then
-        echo "⏳ A deep scan is already running. Its result will arrive when it finishes."
-        exit 0
-    fi
-    # Detached as a transient unit so it outlives the bot's 60s script budget.
-    # Scanning a 500 GB mirror over USB takes minutes; nothing can usefully wait
-    # for it, so it reports to Telegram on its own when done.
-    if systemd-run --unit="$DEEP_UNIT" --description="Umbrel Guardian deep backup verification" \
+    # `is-active --quiet` alone is not enough: a Type=oneshot unit sits in
+    # "activating" for its whole run and only reaches "active" at the end, so
+    # the obvious check misses a scan that is currently running and the launch
+    # below then fails with "unit already exists".
+    DEEP_STATE=$(systemctl is-active "$DEEP_UNIT" 2>/dev/null || true)
+    case "${DEEP_STATE:-}" in
+        active|activating|reloading)
+            echo "⏳ A deep scan is already running. Its result will arrive when it finishes."
+            exit 0 ;;
+    esac
+    # Detached as a transient unit so it outlives the bot's script budget.
+    #
+    # --no-block is load-bearing, not a tweak. systemd-run returns when the unit
+    # has finished STARTING, and for Type=oneshot "started" means the process
+    # has already exited — so without it this call blocks for the entire scan.
+    # That defeats the only reason the unit exists, and it showed up as the
+    # completion message arriving in Telegram BEFORE the "started in the
+    # background" line that was supposed to precede it.
+    if systemd-run --no-block --unit="$DEEP_UNIT" \
+        --description="Umbrel Guardian deep backup verification" \
         --property=Type=oneshot --property=TimeoutStartSec=3600 \
         --setenv=UMBREL_GUARDIAN_DEEP=1 \
         "$SCRIPT_DIR/verify_backup.sh" --deep-run &>/dev/null; then
         echo "🔍 Deep verification started in the background."
         echo "   Comparing every file in $UMBREL_SRC against the $WHAT."
-        echo "   This takes several minutes over USB; the result arrives via Telegram."
+        echo "   The result arrives via Telegram when it finishes."
     else
         echo "⚠️ Could not start the deep scan (systemd-run failed)."
         echo "   Run it in the foreground instead: sudo $SCRIPT_DIR/verify_backup.sh --deep-run"
