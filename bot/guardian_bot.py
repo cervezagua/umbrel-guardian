@@ -543,6 +543,35 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
         except OSError as e:
             send_message(token, chat_id, f"❌ Could not trigger backup: {e}")
 
+    elif lower.startswith("/restore"):
+        # Deliberately NOT in SAFE_COMMANDS: everything else the bot can do
+        # over Telegram is read-only, and this one writes to the data
+        # directory. /lock exists precisely to fence off the commands that can
+        # change the node.
+        if _locked:
+            send_message(token, chat_id,
+                         "🔒 Safe mode: /restore writes to your data directory. "
+                         "Use /unlock <PIN> first.")
+            return
+        # Only two fixed verbs, so the sudoers grant stays two exact command
+        # lines with no wildcard. A wildcard would let any argument reach a
+        # root-run script, and per-file selection is not worth that: from a
+        # phone the useful action is "fix what is broken", and anyone who wants
+        # one specific file is already at a shell.
+        parts = lower.split()
+        if len(parts) == 1:
+            send_message(token, chat_id,
+                         run_privileged_script("restore_file.sh", "--list", timeout=120))
+        elif len(parts) == 2 and parts[1] in ("all", "--all"):
+            send_message(token, chat_id,
+                         run_privileged_script("restore_file.sh", "--all", timeout=240))
+        else:
+            send_message(token, chat_id,
+                         "Usage:\n/restore — list what can be restored\n"
+                         "/restore all — restore all of it\n\n"
+                         "To restore one specific file, over SSH:\n"
+                         "sudo ~/umbrel/umbrel-guardian/scripts/restore_file.sh <path>")
+
     elif lower in ("/disk_health", "/disks"):
         # 120s: SMART probes on a sick drive are exactly the slow case, and the
         # script bounds each sub-probe itself.

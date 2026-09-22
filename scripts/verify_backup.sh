@@ -80,13 +80,11 @@ if ! mountpoint -q "$DEST_BASE" 2>/dev/null; then
 fi
 
 # ── Locate the mirror ────────────────────────────────────────────────────────
+MIRROR=$(guardian_resolve_mirror "$DEST_BASE" "$SCOPE")
 if [ "$SCOPE" = "full" ]; then
-    MIRROR="$DEST_BASE/umbrel-full-clone"
     MARKER="$MIRROR.incomplete"
     WHAT="full clone"
 else
-    # Newest dated snapshot. -t sorts by mtime, so this is the most recent run.
-    MIRROR=$(ls -dt "$DEST_BASE"/umbrel-backup-* 2>/dev/null | head -1)
     MARKER=""
     WHAT="latest essential snapshot"
 fi

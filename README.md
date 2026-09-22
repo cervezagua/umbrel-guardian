@@ -67,6 +67,7 @@ If a previous `config.env` exists, the installer asks before overwriting it — 
 | `/backup` | ⏳ Trigger a manual backup immediately |
 | `/verify_backup` | 🔍 Check the backup is actually restorable — including whether its files still parse (add `deep` for a full file-by-file compare) |
 | `/disk_health` | 🩺 Kernel I/O errors, SMART attributes, SD/eMMC wear (alias: `/disks`) |
+| `/restore` | 🛟 List config files damaged here but intact in the backup; `/restore all` puts them back (blocked by `/lock` — it writes) |
 | `/storage` | 💾 Per-app storage usage |
 | `/notifications` | 🔔 Pending umbrelOS notifications |
 | `/updates` | 🔄 umbrelOS version, release channel, and available updates |
@@ -114,6 +115,39 @@ to start and `/logs <app_id>` will say why. On a node with disk errors, check
 whether the app's `docker-compose.yml` still parses — umbreld rewrites that file
 on every start, so it is the file most likely to be caught mid-write by a
 stalling drive.
+
+### Restoring a damaged file
+
+When the integrity check finds a file damaged here but intact in the backup,
+`/restore` offers to put it back:
+
+```bash
+/restore          # what is damaged and recoverable
+/restore all      # put all of it back
+```
+
+Over SSH you can also name one file:
+
+```bash
+sudo ~/umbrel/umbrel-guardian/scripts/restore_file.sh app-data/plex/settings.yml
+```
+
+**It cannot restore an arbitrary path.** The candidate list is computed from the
+integrity check, never taken from you — the argument only selects from it. That
+is the safety property, not a convenience: a restore tool that accepts any path
+can overwrite good data with old data, or be pointed outside the data directory
+entirely. Ask for something that isn't damaged, or whose *backup* copy is the
+broken one, and it refuses and explains which way round the problem is.
+
+It also stops umbreld before restoring `umbrel.yaml`, because umbreld holds that
+file open and rewrites it on shutdown — restoring underneath a running daemon
+means losing the good copy again minutes later. The broken original is kept in
+`.state/restored/` either way, and the restored file is re-parsed afterwards, as
+a copy that succeeds and produces an unreadable file is worse than no restore at
+all.
+
+`/restore` is blocked by `/lock`. Every other bot command is read-only; this one
+writes to your data directory, which is exactly what safe mode is for.
 
 ### Why verification parses instead of comparing
 
@@ -454,7 +488,7 @@ MemoryMax=128M
 CPUQuota=20%
 ```
 
-> `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands, and `disk_health.sh` / `verify_backup.sh` for diagnostics that need root. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to an explicit list of ten exact command lines and nothing else.
+> `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands, `disk_health.sh` / `verify_backup.sh` for diagnostics that need root, and `restore_file.sh` to put a damaged file back. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to an explicit list of twelve exact command lines and nothing else.
 
 ### Input Validation
 

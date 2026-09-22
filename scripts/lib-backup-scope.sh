@@ -93,6 +93,21 @@ guardian_as_rsync_args() {
 # and has no user account. db/umbrel-seed/seed is what every app's passwords are
 # derived from. Both are small and easy to overlook, which is exactly why they
 # are worth checking explicitly.
+# Where the mirror lives, given a destination and a scope. Extracted the moment
+# a third caller appeared: backup.sh writes it, verify_backup.sh inspects it and
+# restore_file.sh copies out of it, and three independent opinions about which
+# directory is "the backup" is precisely how a restore reads from somewhere the
+# backup never wrote. Prints the path; empty when no snapshot exists yet.
+guardian_resolve_mirror() {
+    local dest_base="$1" scope="${2:-full}"
+    if [ "$scope" = "full" ]; then
+        printf '%s\n' "$dest_base/umbrel-full-clone"
+    else
+        # Newest dated snapshot: -t sorts by mtime, so this is the last run.
+        ls -dt "$dest_base"/umbrel-backup-* 2>/dev/null | head -1
+    fi
+}
+
 guardian_critical_paths() {
     echo "umbrel.yaml"
     echo "db/umbrel-seed/seed"
