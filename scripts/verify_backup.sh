@@ -199,8 +199,9 @@ fi
 # reports agreement. It called a backup restorable while five files inside it
 # were garbage.
 #
-# One python process for every file, never one per file: interpreter startup
-# costs ~19s inside the bot's CPUQuota before any work happens.
+# One python process for every file, never one per file: on a Pi 4 the
+# interpreter startup alone dominates, and one process per file would put the
+# whole check over budget before any file is read.
 INTEGRITY_TIMEOUT=45
 INTEGRITY_CHECKER="$SCRIPT_DIR/lib-integrity.py"
 

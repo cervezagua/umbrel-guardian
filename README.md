@@ -135,13 +135,56 @@ Two consequences, both fixed here:
 
 - **The bot's `CPUQuota` was 20%**, and cgroup limits apply to everything a unit
   spawns — `sudo` does not escape them. So every umbreld-backed command timed out
-  from Telegram while the identical command worked from a shell. It is 100% now:
-  the bot is idle almost all the time and only needs CPU during the seconds it is
-  answering you, so throttling it punished exactly the moment it was useful.
-  `MemoryMax` is what actually contains it, and memory was never the constraint.
+  from Telegram while the identical command worked from a shell. The quota is now
+  a ceiling of one core with a low `CPUWeight` underneath it, which is the
+  primitive that was wanted all along; see
+  [Resource limits on small hardware](#resource-limits-on-small-hardware).
 - **Timeouts were sized against 1.7.4.** There is now one value,
   `GUARDIAN_UMBRELD_TIMEOUT` in `scripts/lib-umbreld.sh`, so the next version's
   surprise is a one-line change rather than seven.
+
+### Resource limits on small hardware
+
+The reference node for these numbers is a Raspberry Pi 4 — 4 GB of RAM, four
+cores — running Bitcoin, Electrs and Monero, which between them hold about
+2.5 GB resident before Guardian starts. Guardian has to be invisible on that
+machine. The limits live in `services/umbrel-guardian-bot.service`:
+
+| directive | value | what it does |
+|---|---|---|
+| `CPUQuota` | `100%` | Ceiling. On four cores, **one core — a quarter of the machine**, not "unlimited". |
+| `CPUWeight` | `20` | Share, and only when the cores are contended. Default is 100, so the bot gets about a fifth of a normal neighbour's share under load. |
+| `MemoryHigh` | `96M` | Throttle and reclaim. The everyday ceiling. |
+| `MemoryMax` | `192M` | Hard kill. The emergency ceiling — 4.7% of this node's RAM. |
+| `OOMPolicy` | `continue` | An OOM-killed child does not take the whole bot down. |
+
+**Why both a quota and a weight.** A quota is enforced whether or not anybody
+else wants the CPU, so `CPUQuota=20%` held the bot to a fifth of a core even on
+a completely idle machine — which is how a 19.2 s umbreld query became 110 s and
+every umbreld-backed Telegram command timed out. A weight costs nothing when
+nothing else is asking and yields when something is. "Get out of Bitcoin's way"
+is a weight, not a quota. The quota stays as a ceiling on a runaway bot, which
+is the only thing a ceiling was ever good for.
+
+**Why the memory limit went up.** `MemoryMax` alone answers a transient spike
+with `SIGKILL`, and this cgroup holds both the Python bot and the Node process
+`umbreld client` spawns underneath it — together they brush 128 M on umbrelOS
+2.0. `MemoryHigh` reclaims first and kills only for a genuine leak, so the
+typical footprint is *lower* than before (96 M rather than 128 M) and only the
+emergency ceiling is higher.
+
+**Checking it on your own node.** Ask the kernel rather than guessing:
+
+```bash
+# Peak memory this service has ever used, and whether it hit a limit
+systemctl show umbrel-guardian-bot -p MemoryPeak -p MemoryCurrent
+cat /sys/fs/cgroup/system.slice/umbrel-guardian-bot.service/memory.events
+```
+
+In `memory.events`, `high` counts throttle events and `max` counts times the
+hard limit was hit; `oom_kill` above zero means something was actually killed.
+All three at `0` means the limits are never being reached and nothing needs
+tuning.
 
 ### umbrelOS 2.0 and the root-only CLI
 
@@ -562,9 +605,15 @@ The bot service (`umbrel-guardian-bot.service`) runs with a minimal privilege se
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=/home/umbrel/umbrel/umbrel-guardian
-MemoryMax=128M
-CPUQuota=20%
+CPUQuota=100%
+CPUWeight=20
+MemoryHigh=96M
+MemoryMax=192M
+OOMPolicy=continue
 ```
+
+See [Resource limits on small hardware](#resource-limits-on-small-hardware) for
+why those numbers are what they are.
 
 > `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands, `disk_health.sh` / `verify_backup.sh` for diagnostics that need root, and `restore_file.sh` to put a damaged file back. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to an explicit list of eighteen exact command lines and nothing else.
 

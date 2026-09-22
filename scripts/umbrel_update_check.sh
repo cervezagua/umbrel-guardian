@@ -45,12 +45,11 @@ MODE="check"
 [ "${1:-}" = "--report" ] && MODE="report"
 
 UMBRELD_BIN="${UMBRELD_BIN:-umbreld}"
-# 45s, not the 10s that looks generous for a local query. `umbreld client` is
-# Node and burns ~2.7s of CPU to answer; the bot's unit sets CPUQuota=20%, and
-# cgroup limits apply to every process the bot spawns. Measured on a live node:
-# 1.8s unconstrained, 19.25s under that quota — a 10x multiplier. A 10s timeout
-# is therefore guaranteed to fail from the bot while passing every test run from
-# a shell, which is exactly how this shipped.
+# Not the 10s that looks generous for a local query. `umbreld client` is Node,
+# and on umbrelOS 2.0 a single query costs ~19s even unconstrained. A 10s
+# timeout is therefore guaranteed to fail on 2.0 while passing every test run
+# against 1.7.4, which is exactly how this shipped. The number itself lives in
+# scripts/lib-umbreld.sh, with the measurements behind it.
 UMBRELD_TIMEOUT="$GUARDIAN_UMBRELD_TIMEOUT"
 # How long between network update checks. Six hours is far more often than
 # umbrelOS ships, and keeps the timer from making an outbound call every 30
