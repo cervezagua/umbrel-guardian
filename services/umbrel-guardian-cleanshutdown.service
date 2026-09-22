@@ -1,0 +1,34 @@
+# Records whether the machine was shut down cleanly.
+#
+# There is no reliable way to ask, after the fact, whether the last power-off
+# was orderly — and it matters more than it sounds. An unclean power-off while
+# umbreld is mid-write leaves files with the right length and null bytes
+# inside: correct size, correct timestamp, completely unusable. That is how a
+# node lost five app configs, its account block and an app settings file in a
+# single day, with the kernel logging no I/O error at all because nothing
+# actually failed. The write simply never finished.
+#
+# So the answer is recorded rather than inferred. ExecStart drops a marker when
+# the machine comes up; ExecStop removes it when systemd shuts down in an
+# orderly way. A marker still present at the next boot means the previous one
+# never got to run — the plug was pulled.
+#
+# DefaultDependencies=no with Conflicts/Before=shutdown.target is what makes
+# ExecStop actually run during shutdown rather than being torn down with
+# everything else.
+[Unit]
+Description=Umbrel Guardian clean-shutdown marker
+DefaultDependencies=no
+After=local-fs.target
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mkdir -p /home/umbrel/umbrel/umbrel-guardian/.state
+ExecStartPost=/bin/touch /home/umbrel/umbrel/umbrel-guardian/.state/boot-in-progress
+ExecStop=/bin/rm -f /home/umbrel/umbrel/umbrel-guardian/.state/boot-in-progress
+
+[Install]
+WantedBy=multi-user.target

@@ -20,6 +20,9 @@ source "$CONFIG"
 
 THRESHOLD="${DISK_THRESHOLD:-90}"
 STATE_FILE="/run/umbrel-guardian-health.last"
+# Persistent state, unlike STATE_FILE above: /run is tmpfs and resets on every
+# boot, which is exactly wrong for anything describing the previous one.
+STATE_DIR="$(dirname "$SCRIPT_DIR")/.state"
 HOST="$(hostname)"
 
 FORCE=0
@@ -123,6 +126,25 @@ if [ -x "$DISK_HEALTH" ]; then
     while IFS= read -r line; do
         [ -n "$line" ] && ISSUES+=("$line")
     done <<< "${DISK_ISSUES:-}"
+fi
+
+# ── Unclean shutdown ─────────────────────────────────────────────────────────
+# Written by the pre-start hook when the previous boot's shutdown marker was
+# still present, meaning the machine lost power rather than shutting down.
+#
+# Worth interrupting someone for, because it is the most likely cause of the
+# config corruption the integrity check below hunts for, it leaves no kernel
+# error behind, and unlike failing hardware it is completely preventable. The
+# file carries the boot id it was recorded for, so the warning describes the
+# boot you are actually in and goes quiet after the next clean shutdown rather
+# than accusing you indefinitely.
+UNCLEAN_FILE="$STATE_DIR/unclean-shutdown"
+if [ -f "$UNCLEAN_FILE" ]; then
+    RECORDED_BOOT=$(head -n1 "$UNCLEAN_FILE" 2>/dev/null || true)
+    CURRENT_BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+    if [ -n "${RECORDED_BOOT:-}" ] && [ "$RECORDED_BOOT" = "$CURRENT_BOOT" ]; then
+        ISSUES+=("⚠️ The last shutdown was unclean (power loss or held button). This is the most common cause of corrupted config files — always use 'sudo shutdown -h now' or the dashboard.")
+    fi
 fi
 
 # ── Backup integrity ─────────────────────────────────────────────────────────

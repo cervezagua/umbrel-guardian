@@ -130,6 +130,64 @@ if getent group docker &>/dev/null; then
     fi
 fi
 
+# ── Was the last shutdown clean? ─────────────────────────────────────────────
+# Checked here, at pre-start, because this runs before the marker unit re-arms
+# for the current boot. A marker left over from last time means ExecStop never
+# ran — the machine lost power instead of shutting down.
+#
+# This is not a footnote. An unclean power-off while umbreld is mid-write
+# leaves a file with the right size, the right timestamp and null bytes inside,
+# and the kernel logs no I/O error because nothing failed — the write just
+# never finished. It is the single most likely cause of config corruption on an
+# SD card, and it is entirely preventable by shutting down properly. Nothing in
+# umbrelOS tells you it happened.
+#
+# The verdict is stamped with the current boot id so the alert describes THIS
+# boot and disappears after the next clean one, instead of accusing you forever.
+BOOT_MARKER="$STATE_DIR/boot-in-progress"
+UNCLEAN_FILE="$STATE_DIR/unclean-shutdown"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+if [ -e "$BOOT_MARKER" ]; then
+    printf '%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)" \
+        > "$UNCLEAN_FILE" 2>/dev/null || true
+    echo "  ⚠️ Previous shutdown was unclean (power loss?) — flagged for alerting"
+else
+    rm -f "$UNCLEAN_FILE" 2>/dev/null || true
+fi
+chown -R umbrel:umbrel "$STATE_DIR" 2>/dev/null || true
+
+# ── Cap the journal ──────────────────────────────────────────────────────────
+# umbrelOS ships no journal limit, and on the node this was written for the
+# journal reached 1.8 GB on the system SD card. That is not just wasted space:
+# every kernel-log query had to read through it, which is what made disk
+# monitoring take 75 seconds a run, and it is continuous write load on exactly
+# the card whose wear we are trying to slow.
+#
+# /etc is restored from the image each boot, so the drop-in is rewritten every
+# time, same as the sudoers and sysctl files above. journald only reads it at
+# start — which already happened, long before this hook — so the live journal
+# is vacuumed here too, and the drop-in makes it stick from the next boot on.
+JOURNALD_CONF=/etc/systemd/journald.conf.d/90-umbrel-guardian.conf
+JOURNAL_MAX="${JOURNAL_MAX_SIZE:-200M}"
+if [[ "$JOURNAL_MAX" =~ ^[0-9]+[KMG]?$ ]]; then
+    mkdir -p /etc/systemd/journald.conf.d 2>/dev/null || true
+    cat > "$JOURNALD_CONF" <<JOURNAL_EOF
+[Journal]
+SystemMaxUse=$JOURNAL_MAX
+JOURNAL_EOF
+    # Only vacuum when actually over the cap. Vacuuming is slow on a large
+    # journal and this hook shares a 5-minute budget with everything else, so
+    # it is bounded and its failure is never fatal.
+    JOURNAL_NOW=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]?B?' | tail -1 || true)
+    if timeout 120 journalctl --vacuum-size="$JOURNAL_MAX" &>/dev/null; then
+        echo "  ✅ Journal capped at $JOURNAL_MAX (was ${JOURNAL_NOW:-unknown})"
+    else
+        echo "  ⚠️ Journal vacuum did not finish; cap applies from next boot"
+    fi
+else
+    echo "  ⚠️ JOURNAL_MAX_SIZE='$JOURNAL_MAX' is not a valid size — skipping journal cap"
+fi
+
 # ── Bump inotify watch limits (system-wide) ──────────────────────────────────
 # Umbrel 1.7.x consumes more inotify watches than 1.5; default limits cause
 # .path units (including umbrel-guardian-backup-trigger.path AND systemd's own
@@ -283,6 +341,9 @@ rm -f /etc/sudoers.d/umbrel-guardian 2>/dev/null || true
 # watches for it and starts umbrel-guardian-backup.service.  No sudo needed.
 cp "$INSTALL_DIR/services/umbrel-guardian-backup-trigger.path" "$SYSTEMD_DIR/"
 
+# Clean-shutdown marker. Its whole job is ExecStop; see the unit for why.
+cp "$INSTALL_DIR/services/umbrel-guardian-cleanshutdown.service" "$SYSTEMD_DIR/"
+
 # ── Deploy OTA-recovery hook (SSD-overlay path) ─────────────────────────────
 # Umbrel 1.7.x's wrapper at /opt/umbrel-custom-hooks/run-pre-start looks for
 # /home/umbrel/umbrel/custom-hooks/pre-start at boot. The path lives on the
@@ -353,6 +414,7 @@ systemctl enable --now umbrel-guardian-health.timer
 systemctl enable umbrel-guardian-bot.service
 systemctl restart umbrel-guardian-bot.service  # restart so any group/code changes take effect
 systemctl enable --now umbrel-guardian-daily.timer
+systemctl enable --now umbrel-guardian-cleanshutdown.service
 
 if [ -n "${BACKUP_PATH:-}" ]; then
     systemctl enable --now umbrel-guardian-backup.timer
