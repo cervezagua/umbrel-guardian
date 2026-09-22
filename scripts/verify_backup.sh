@@ -43,8 +43,9 @@ source "$SCRIPT_DIR/lib-backup-scope.sh"
 
 MODE="fast"
 case "${1:-}" in
-    --deep)     MODE="deep-start" ;;
-    --deep-run) MODE="deep-run" ;;
+    --deep)      MODE="deep-start" ;;
+    --deep-run)  MODE="deep-run" ;;
+    --integrity) MODE="integrity" ;;
     "")         ;;
     *)          echo "Usage: $0 [--deep]" >&2; exit 2 ;;
 esac
@@ -184,6 +185,59 @@ Every in-scope file matches the source."
     exit 0
 fi
 
+# ── Integrity ────────────────────────────────────────────────────────────────
+# See lib-integrity.py for why this parses rather than compares. In short: the
+# deep scan compares the mirror against the source, so when the source is
+# corrupt and the backup faithfully copied that corruption, the comparison
+# reports agreement. It called a backup restorable while five files inside it
+# were garbage.
+#
+# One python process for every file, never one per file: interpreter startup
+# costs ~19s inside the bot's CPUQuota before any work happens.
+INTEGRITY_TIMEOUT=45
+INTEGRITY_CHECKER="$SCRIPT_DIR/lib-integrity.py"
+
+# Which side is damaged decides the remedy, so each verdict gets its own
+# sentence. A message that only says "corrupt" leaves the reader to work out
+# which copy to trust, which is the part that is actually hard at 3am.
+integrity_line() {
+    case "$2" in
+        source) echo "🚨 $1 is damaged on this node — the backup copy is good, restore it" ;;
+        mirror) echo "🚨 $1 is damaged in the BACKUP — the node is fine, run a backup to replace it" ;;
+        both)   echo "🚨 $1 is damaged on the node AND in the backup — rebuild it from the app store" ;;
+    esac
+}
+
+if [ "$MODE" = "integrity" ]; then
+    # Deterministic output for health_check.sh: identical wording every run, so
+    # its dedup hash changes only when the situation does. No counts, no paths
+    # that vary, no parser messages that might differ between versions.
+    if [ ! -r "$INTEGRITY_CHECKER" ]; then
+        # Silent: a missing file here means a partial deploy, and alerting on it
+        # every 30 minutes would train you to ignore the channel. /verify_backup
+        # says so loudly, where a human is asking.
+        exit 0
+    fi
+    OUT=$(timeout "$INTEGRITY_TIMEOUT" python3 "$INTEGRITY_CHECKER" "$UMBREL_SRC" "$MIRROR" 2>/dev/null)
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+        # Never silently clean. A checker that failed has found nothing, and
+        # reporting nothing as "no corruption" is the lie this whole file exists
+        # to avoid.
+        if [ "$RC" -eq 124 ]; then
+            echo "⚠️ Backup integrity check timed out after ${INTEGRITY_TIMEOUT}s — corruption would not be seen."
+        else
+            echo "⚠️ Backup integrity check failed (exit $RC) — corruption would not be seen."
+        fi
+        exit 1
+    fi
+    printf '%s\n' "${OUT:-}" | while IFS=$'\t' read -r KIND REL VERDICT _; do
+        [ "$KIND" = "BAD" ] || continue
+        integrity_line "$REL" "$VERDICT"
+    done
+    exit 0
+fi
+
 # ── Fast path ────────────────────────────────────────────────────────────────
 # Everything below is stat-level work on a handful of known paths. No directory
 # walking: the whole point is an answer in under a second, so it stays inside
@@ -217,6 +271,37 @@ while read -r REL; do
         PROBLEMS=$((PROBLEMS + 1))
     fi
 done < <(guardian_critical_paths)
+
+# Integrity. The checks above prove the files EXIST and are non-empty; this
+# proves they can still be read. A file can be the right size, the right age and
+# entirely unusable — that is precisely the failure that got past every earlier
+# version of this script.
+if [ -r "$INTEGRITY_CHECKER" ]; then
+    INTEGRITY_RAW=$(timeout "$INTEGRITY_TIMEOUT" python3 "$INTEGRITY_CHECKER" "$UMBREL_SRC" "$MIRROR" 2>/dev/null)
+    INTEGRITY_RC=$?
+    if [ "$INTEGRITY_RC" -ne 0 ]; then
+        echo "⚠️ Integrity check did not complete ($([ "$INTEGRITY_RC" -eq 124 ] \
+            && echo "timed out after ${INTEGRITY_TIMEOUT}s" || echo "exit $INTEGRITY_RC"))"
+        echo "   Corrupt files would NOT have been detected."
+        PROBLEMS=$((PROBLEMS + 1))
+    elif [ -n "${INTEGRITY_RAW:-}" ]; then
+        while IFS=$'\t' read -r KIND REL VERDICT SRC_ST MIR_ST DETAIL; do
+            case "$KIND" in
+                BAD)
+                    integrity_line "$REL" "$VERDICT"
+                    [ -n "${DETAIL:-}" ] && echo "   ($SRC_ST on node, $MIR_ST in backup: $DETAIL)"
+                    PROBLEMS=$((PROBLEMS + 1)) ;;
+                PROBE)
+                    echo "⚠️ Could not check $REL — $VERDICT" ;;
+            esac
+        done <<< "$INTEGRITY_RAW"
+    else
+        echo "✅ Config files parse cleanly on both sides"
+    fi
+else
+    echo "⚠️ Integrity checker missing (scripts/lib-integrity.py) — corruption not checked"
+    PROBLEMS=$((PROBLEMS + 1))
+fi
 
 # Age. Prefer a stamp written by the backup itself; fall back to asking systemd
 # when the last run of the unit finished, which needs no cooperation from

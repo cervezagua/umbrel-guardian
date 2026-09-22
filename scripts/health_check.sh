@@ -125,6 +125,23 @@ if [ -x "$DISK_HEALTH" ]; then
     done <<< "${DISK_ISSUES:-}"
 fi
 
+# ── Backup integrity ─────────────────────────────────────────────────────────
+# Corruption is silent. It produces no kernel error, no failed backup and no
+# failed comparison — the disk writes garbage, rsync copies the garbage, and
+# every check that only compares the two reports agreement. Nothing above this
+# line would notice, which is why a node ran for days with five destroyed files
+# in both its data directory and its backup while every check said fine.
+#
+# Same contract as disk_health.sh: deterministic lines, so identical findings
+# produce an identical fingerprint and alert exactly once.
+VERIFY_BACKUP="$SCRIPT_DIR/verify_backup.sh"
+if [ -x "$VERIFY_BACKUP" ]; then
+    INTEGRITY_ISSUES=$(sudo -n "$VERIFY_BACKUP" --integrity 2>/dev/null || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] && ISSUES+=("$line")
+    done <<< "${INTEGRITY_ISSUES:-}"
+fi
+
 # ── Deduplication ────────────────────────────────────────────────────────────
 # Build a deterministic fingerprint of the current issues.
 # Only send notifications when this fingerprint differs from last run.

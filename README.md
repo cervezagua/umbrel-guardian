@@ -65,7 +65,7 @@ If a previous `config.env` exists, the installer asks before overwriting it — 
 | `/restart unhealthy` | 🔄 Restart apps in unknown/failed state (skips intentionally stopped apps) |
 | `/logs <app_id> [n]` | 📋 Last N lines of an app's container logs (default: 50) |
 | `/backup` | ⏳ Trigger a manual backup immediately |
-| `/verify_backup` | 🔍 Check the backup is actually restorable (add `deep` for a full file-by-file compare) |
+| `/verify_backup` | 🔍 Check the backup is actually restorable — including whether its files still parse (add `deep` for a full file-by-file compare) |
 | `/disk_health` | 🩺 Kernel I/O errors, SMART attributes, SD/eMMC wear (alias: `/disks`) |
 | `/storage` | 💾 Per-app storage usage |
 | `/notifications` | 🔔 Pending umbrelOS notifications |
@@ -114,6 +114,47 @@ to start and `/logs <app_id>` will say why. On a node with disk errors, check
 whether the app's `docker-compose.yml` still parses — umbreld rewrites that file
 on every start, so it is the file most likely to be caught mid-write by a
 stalling drive.
+
+### Why verification parses instead of comparing
+
+A backup check that compares the mirror against the source cannot see
+corruption. rsync faithfully copies a file whose contents have been destroyed,
+and afterwards both sides agree — so the comparison reports success while the
+backup holds garbage.
+
+That is not hypothetical. On the node this was built for, a failing SD card
+null-filled five `docker-compose.yml` files. `rsync` copied them. `/verify_backup`
+reported **"looks restorable"** while every one of those files in the backup was
+unusable, because the mirror matched the source perfectly.
+
+So `/verify_backup` now **parses** the files umbrelOS cannot start without —
+`umbrel.yaml`, every `app-data/*/settings.yml`, every
+`app-data/*/docker-compose.yml` — on each side independently, and reports which
+side is damaged. That distinction is the whole point, because the remedy is
+different each time:
+
+| Finding | What it means | What to do |
+|---|---|---|
+| Damaged on the node, good in the backup | The node is broken | Restore that file from the mirror |
+| Good on the node, damaged in the backup | The backup can't restore it | Run a backup to replace it |
+| Damaged on both sides | Neither copy is usable | Rebuild it from the app store template |
+
+Three details this earned the hard way:
+
+- **Parsing, not byte-scanning.** A scan for NUL bytes was tried first and
+  passed a file full of other non-printable garbage; the app stayed broken while
+  the check called it clean. "Can umbreld read this?" is the only question worth
+  asking, and parsing is the only way to ask it.
+- **Valid YAML can still be empty of what matters.** `umbrel.yaml` parsed
+  perfectly on a node whose entire `user` block — account, password hash, 2FA
+  secret — had vanished. Structure is checked, not just syntax.
+- **Unreadable is never reported as damaged.** A permission error is a probe
+  failure. Conflating the two sends you chasing a file that is perfectly fine,
+  which happened once already.
+
+The same check runs on the health timer, so corruption reaches Telegram on its
+own rather than waiting for you to ask. And a check that *could not run* never
+reports "clean" — it says it could not run.
 
 ### Disk health, and why it reads the ring buffer
 
@@ -218,6 +259,7 @@ umbrel-guardian/
 │   ├── health_check.sh         ← Proactive health alerts (timer)
 │   ├── backup.sh               ← rsync backup with flock + rotation
 │   ├── lib-backup-scope.sh     ← Shared: what is in scope / excluded (sourced, not run)
+│   ├── lib-integrity.py        ← Parses critical configs on both sides (called, not run)
 │   ├── verify_backup.sh        ← Is the backup restorable? (fast + deep modes)
 │   ├── disk_health.sh          ← SMART / eMMC wear / kernel I/O errors (root)
 │   ├── umbrel_notifications.sh ← Relay umbrelOS notifications to Telegram
@@ -412,7 +454,7 @@ MemoryMax=128M
 CPUQuota=20%
 ```
 
-> `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands, and `disk_health.sh` / `verify_backup.sh` for diagnostics that need root. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to an explicit list of nine exact command lines and nothing else.
+> `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands, and `disk_health.sh` / `verify_backup.sh` for diagnostics that need root. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to an explicit list of ten exact command lines and nothing else.
 
 ### Input Validation
 

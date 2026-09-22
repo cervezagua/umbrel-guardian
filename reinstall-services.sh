@@ -264,6 +264,7 @@ umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/disk_hea
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --issues
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_backup.sh
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_backup.sh --deep
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_backup.sh --integrity
 SUDOERS_EOF
 # Validate with visudo before installing — a broken sudoers file breaks all sudo.
 if visudo -c -f "$TMP_SUDOERS" &>/dev/null; then
