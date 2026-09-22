@@ -126,6 +126,13 @@ Measured on a Raspberry Pi 4 running umbrelOS 2.0.0, one `system.version.query`:
 | inside `CPUQuota=20%` | **110 s** |
 | inside `MemoryMax=128M` | 10.1 s |
 
+> That last row measures one query in a throwaway scope, and it is **not**
+> evidence that the memory limit was harmless — an earlier draft of this section
+> said it was. The live bot's own cgroup reported `memory.events` `max=605`:
+> 605 times it reached the 128 M ceiling and the kernel reclaimed to stay under
+> it. Nothing was OOM-killed, but the limit was binding constantly. See
+> [Resource limits on small hardware](#resource-limits-on-small-hardware).
+
 The same call on 1.7.4 took **1.8 s**. 2.0's CLI opens a WebSocket and mints a
 ticket via `user.createWebSocketTicket` before every query, so there are several
 round trips where there used to be one — roughly a tenfold cost increase with no
@@ -798,7 +805,26 @@ sudo git pull
 sudo bash reinstall-services.sh
 ```
 
-Pulls the latest code and re-deploys systemd services. Your `config.env` is not tracked by git and won't be overwritten.
+Pulls the latest code and re-deploys systemd services. Your `config.env` is not
+tracked by git and won't be overwritten.
+
+**If `git pull` aborts with "Your local changes to the following files would be
+overwritten by merge"**, check what actually differs before discarding anything:
+
+```bash
+git diff <the file it named>
+```
+
+A diff showing only `old mode 100644 / new mode 100755` is a permission bit, not
+a content change, and is safe to drop with `git checkout -- <file>`. This used to
+happen on every update: `reinstall-services.sh` runs `chmod +x` over
+`scripts/*.sh`, so any script committed non-executable came back as a modified
+file and blocked the next pull. The install directory *is* the git checkout, so
+the modes the installer sets have to match the modes git records — there is now a
+test asserting exactly that, and all 24 installed executables are committed 755.
+
+If the diff shows real content changes, you edited that file: `git stash` keeps
+the edits, `git checkout --` throws them away.
 
 ---
 

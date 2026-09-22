@@ -18,7 +18,13 @@ GUARDIAN_UMBRELD_WRAPPER="${GUARDIAN_UMBRELD_WRAPPER:-/usr/local/lib/umbrel-guar
 #
 #   unconstrained                19.2 s
 #   inside CPUQuota=20%         110.0 s
-#   inside MemoryMax=128M        10.1 s   (memory is not a factor)
+#   inside MemoryMax=128M        10.1 s
+#
+# That third row is one query in a throwaway scope and does NOT mean the memory
+# limit was harmless: the live bot's cgroup later reported memory.events max=605
+# — 605 times it reached the 128M ceiling and the kernel had to reclaim to stay
+# under it. Nothing was ever OOM-killed, but the limit was binding constantly.
+# See the unit file for what replaced it.
 #
 # The 19.2 s baseline is the surprise. The same call on 1.7.4 took 1.8 s. 2.0's
 # CLI opens a WebSocket and mints a ticket via user.createWebSocketTicket before
