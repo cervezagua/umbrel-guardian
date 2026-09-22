@@ -4,6 +4,13 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+if [ ! -r "$SCRIPT_DIR/lib-umbreld.sh" ]; then
+    echo "⚠️ scripts/lib-umbreld.sh is missing — this is a partial install." >&2
+    echo "   Re-run: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/lib-umbreld.sh"
 CONFIG="$(dirname "$SCRIPT_DIR")/config.env"
 source "$CONFIG"
 
@@ -28,7 +35,7 @@ UPTIME_STR=$(uptime -p 2>/dev/null || uptime)
 # App count (non-fatal if umbreld is unavailable)
 APP_COUNT="?"
 if command -v umbreld &>/dev/null; then
-    _RAW=$(timeout 45 umbreld client apps.list.query 2>&1) || true
+    _RAW=$(guardian_umbreld 45 apps.list.query 2>&1) || true
     APP_COUNT=$(echo "$_RAW" | python3 -c "
 import sys, json
 raw = sys.stdin.read()

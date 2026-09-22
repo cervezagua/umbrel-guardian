@@ -13,6 +13,10 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+if [ -r "$SCRIPT_DIR/lib-umbreld.sh" ]; then
+    source "$SCRIPT_DIR/lib-umbreld.sh"
+fi
 CONFIG="$(dirname "$SCRIPT_DIR")/config.env"
 SEND="$SCRIPT_DIR/telegram_send.sh"
 
@@ -74,9 +78,9 @@ if command -v umbreld &>/dev/null; then
     # The heredoc stays (this script needs both quote styles internally, so
     # collapsing it into python3 -c would be a quoting minefield); only the data
     # path moves.
-    APP_RAW=$(timeout 45 umbreld client apps.list.query 2>&1)
+    APP_RAW=$(guardian_umbreld 45 apps.list.query 2>&1)
     APP_ISSUES=$(APP_RAW="$APP_RAW" python3 - <<'PYEOF'
-import os, json
+import os, json, sys
 
 raw = os.environ.get("APP_RAW", "")
 decoder = json.JSONDecoder()

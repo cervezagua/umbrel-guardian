@@ -23,6 +23,13 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+if [ ! -r "$SCRIPT_DIR/lib-umbreld.sh" ]; then
+    echo "⚠️ scripts/lib-umbreld.sh is missing — this is a partial install." >&2
+    echo "   Re-run: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/lib-umbreld.sh"
 INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
 CONFIG="$INSTALL_DIR/config.env"
 SEND="$SCRIPT_DIR/telegram_send.sh"
@@ -59,7 +66,7 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 umbreld_json() {
     local query="$1"; shift
     local raw
-    raw=$(timeout "$UMBRELD_TIMEOUT" "$UMBRELD_BIN" client "$query" 2>/dev/null) || return 1
+    raw=$(guardian_umbreld "$UMBRELD_TIMEOUT" "$query" 2>/dev/null) || return 1
     [ -n "${raw:-}" ] || return 1
     printf '%s' "$raw" | python3 -c '
 import sys, json
@@ -87,7 +94,7 @@ elif data is not None and not isinstance(data, (dict, list)):
 ' "$@" 2>/dev/null
 }
 
-command -v "$UMBRELD_BIN" &>/dev/null || {
+guardian_umbreld_available || {
     [ "$MODE" = "report" ] && echo "ℹ️ umbreld not found — update checks unavailable."
     exit 0
 }

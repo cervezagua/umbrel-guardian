@@ -26,6 +26,13 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+if [ ! -r "$SCRIPT_DIR/lib-umbreld.sh" ]; then
+    echo "⚠️ scripts/lib-umbreld.sh is missing — this is a partial install." >&2
+    echo "   Re-run: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/lib-umbreld.sh"
 CONFIG="$(dirname "$SCRIPT_DIR")/config.env"
 SEND="$SCRIPT_DIR/telegram_send.sh"
 STATE_DIR="$(dirname "$SCRIPT_DIR")/.state"
@@ -48,12 +55,12 @@ UMBRELD_BIN="${UMBRELD_BIN:-umbreld}"
 UMBRELD_TIMEOUT=45
 MAX_MESSAGES=5
 
-command -v "$UMBRELD_BIN" &>/dev/null || {
+guardian_umbreld_available || {
     [ "$MODE" = "list" ] && echo "ℹ️ umbreld not found — notification relay unavailable."
     exit 0
 }
 
-RAW=$(timeout "$UMBRELD_TIMEOUT" "$UMBRELD_BIN" client notifications.get.query 2>&1)
+RAW=$(guardian_umbreld "$UMBRELD_TIMEOUT" notifications.get.query 2>&1)
 RC=$?
 
 # umbrelOS 1.7.x may not have the notifications module at all, and an upgrade

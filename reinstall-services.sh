@@ -325,6 +325,16 @@ umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_b
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_backup.sh --integrity
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/restore_file.sh --list
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/restore_file.sh --all
+
+# The umbreld gateway. Five read-only queries that take no arguments, and one
+# mutation whose only wildcard is the app id — which the gateway itself
+# validates against umbrelOS's id format before it reaches umbreld.
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh apps.list.query
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh notifications.get.query
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh system.version.query
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh system.checkUpdate.query
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh system.getReleaseChannel.query
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh apps.restart.mutate --appId *
 SUDOERS_EOF
 # Validate with visudo before installing — a broken sudoers file breaks all sudo.
 if visudo -c -f "$TMP_SUDOERS" &>/dev/null; then
@@ -335,6 +345,24 @@ else
     visudo -c -f "$TMP_SUDOERS" || true
 fi
 rm -f "$TMP_SUDOERS"
+
+# ── Root-owned gateway to umbreld ────────────────────────────────────────────
+# umbrelOS 2.0 made `umbreld client` root-only. Guardian's scripts run as
+# `umbrel`, so without this every umbreld-backed command breaks on 2.0.
+#
+# It is deployed HERE, outside $INSTALL_DIR, on purpose. A sudo-granted script
+# that its own caller can rewrite is not a privilege boundary — and everything
+# under /home/umbrel is writable by `umbrel`. Root-owned and mode 0755, with no
+# config, libraries or state beside it to subvert either.
+PRIV_DIR=/usr/local/lib/umbrel-guardian
+mkdir -p "$PRIV_DIR"
+if [ -f "$INSTALL_DIR/scripts/umbreld-query.sh" ]; then
+    install -o root -g root -m 0755 "$INSTALL_DIR/scripts/umbreld-query.sh" \
+        "$PRIV_DIR/umbreld-query.sh"
+    echo "  ✅ Deployed umbreld gateway → $PRIV_DIR/umbreld-query.sh"
+else
+    echo "  ⚠️ scripts/umbreld-query.sh missing — umbreld commands will not work on umbrelOS 2.0"
+fi
 
 # Clean up the LEGACY sudoers file from a prior design (different filename)
 rm -f /etc/sudoers.d/umbrel-guardian 2>/dev/null || true

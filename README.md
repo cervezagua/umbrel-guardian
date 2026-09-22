@@ -116,6 +116,46 @@ whether the app's `docker-compose.yml` still parses — umbreld rewrites that fi
 on every start, so it is the file most likely to be caught mid-write by a
 stalling drive.
 
+### umbrelOS 2.0 and the root-only CLI
+
+umbrelOS 2.0 made `umbreld client` root-only. From its own
+`modules/cli-client.ts`:
+
+> This credential deliberately lives below a 0700 auth directory as a 0600
+> file. The production CLI is therefore root-only; loosening the file mode
+> would turn local shell access into full umbreld API access.
+
+Every Guardian script that asks umbreld anything runs as the `umbrel` user, so
+without a change all of these break on 2.0: `/apps`, `/status`, `/health`,
+`/restart`, `/notifications` and `/updates`.
+
+The lazy fix is a sudoers grant per script, which hands `umbrel` precisely the
+"full umbreld API access" that comment is guarding against — through the side
+door, with Guardian holding it open. So the grant is for a **gateway** instead:
+
+```
+scripts/umbreld-query.sh  →  /usr/local/lib/umbrel-guardian/umbreld-query.sh
+```
+
+It allows six procedures and nothing else — five read-only queries that take no
+arguments, plus `apps.restart.mutate` with an app id it validates against
+umbrelOS's own format. The result is **tighter than 1.7.4**, where `umbrel`
+could already run `umbreld client <anything>` unaided. `notifications.clear.mutate`
+is deliberately unreachable: clearing removes a notice from the dashboard for
+everyone, and Guardian is read-only about notifications by design.
+
+It is deployed **outside** `$INSTALL_DIR`, as `root:root` mode 0755, because a
+sudo-granted script its own caller can rewrite is not a privilege boundary —
+and everything under `/home/umbrel` is writable by `umbrel`. It has no config,
+libraries or state beside it, so there is nothing alongside it to subvert
+either.
+
+> **Still outstanding:** the *other* sudo-granted scripts (`system_control.sh`,
+> `disk_health.sh`, `verify_backup.sh`, `restore_file.sh`) do still live in an
+> `umbrel`-writable directory. That is a pre-existing weakness, not one 2.0
+> introduced, and moving them needs the installer to separate code from config
+> and state. It is the next piece of work, not a solved problem.
+
 ### Restoring a damaged file
 
 When the integrity check finds a file damaged here but intact in the backup,
@@ -294,6 +334,9 @@ umbrel-guardian/
 │   ├── backup.sh               ← rsync backup with flock + rotation
 │   ├── lib-backup-scope.sh     ← Shared: what is in scope / excluded (sourced, not run)
 │   ├── lib-integrity.py        ← Parses critical configs on both sides (called, not run)
+│   ├── lib-umbreld.sh          ← Shared: how to reach umbreld (sourced, not run)
+│   ├── umbreld-query.sh        ← Root-only gateway, deployed outside $INSTALL_DIR
+│   ├── restore_file.sh         ← Put a damaged file back from the backup
 │   ├── verify_backup.sh        ← Is the backup restorable? (fast + deep modes)
 │   ├── disk_health.sh          ← SMART / eMMC wear / kernel I/O errors (root)
 │   ├── umbrel_notifications.sh ← Relay umbrelOS notifications to Telegram
@@ -488,7 +531,7 @@ MemoryMax=128M
 CPUQuota=20%
 ```
 
-> `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands, `disk_health.sh` / `verify_backup.sh` for diagnostics that need root, and `restore_file.sh` to put a damaged file back. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to an explicit list of twelve exact command lines and nothing else.
+> `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands, `disk_health.sh` / `verify_backup.sh` for diagnostics that need root, and `restore_file.sh` to put a damaged file back. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to an explicit list of eighteen exact command lines and nothing else.
 
 ### Input Validation
 

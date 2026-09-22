@@ -4,6 +4,15 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+if [ ! -r "$SCRIPT_DIR/lib-umbreld.sh" ]; then
+    echo "⚠️ scripts/lib-umbreld.sh is missing — this is a partial install." >&2
+    echo "   Re-run: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/lib-umbreld.sh"
+
 APP="${1:-}"
 
 # 120s, not 60. A restart is a stop plus a start of every container an app
@@ -33,7 +42,7 @@ fi
 #      its dash-substituted form), use it. Lets `/restart adguard` → adguard-home.
 #   4. If multiple prefix matches, report them all so the user can be specific.
 # Capture all output (stdout + stderr) — umbreld may write JSON to either.
-RAW=$(timeout 45 umbreld client apps.list.query 2>&1) || true
+RAW=$(guardian_umbreld 45 apps.list.query 2>&1) || true
 RESPONSE=$(echo "$RAW" | python3 -c "
 import sys, json
 
@@ -97,7 +106,7 @@ esac
 # and the message then blamed the app id — which the block above had JUST
 # resolved against the installed list. Being told to check something already
 # verified sends you looking in the one place the fault cannot be.
-RESTART_OUT=$(timeout "$RESTART_TIMEOUT" umbreld client apps.restart.mutate --appId "$APP" 2>&1)
+RESTART_OUT=$(guardian_umbreld "$RESTART_TIMEOUT" apps.restart.mutate --appId "$APP" 2>&1)
 RESTART_RC=$?
 
 if [ "$RESTART_RC" -eq 0 ]; then
