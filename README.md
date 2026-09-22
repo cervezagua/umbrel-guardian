@@ -173,11 +173,19 @@ sudo ~/umbrel/umbrel-guardian/scripts/restore_file.sh app-data/plex/settings.yml
 ```
 
 **It cannot restore an arbitrary path.** The candidate list is computed from the
-integrity check, never taken from you — the argument only selects from it. That
-is the safety property, not a convenience: a restore tool that accepts any path
-can overwrite good data with old data, or be pointed outside the data directory
-entirely. Ask for something that isn't damaged, or whose *backup* copy is the
-broken one, and it refuses and explains which way round the problem is.
+integrity check, and the argument is validated in its own right: a plain
+relative path, no `..`, nothing outside the data directory. Ask for something
+that isn't damaged, or whose *backup* copy is the broken one, and it refuses and
+explains which way round the problem is.
+
+**It never writes through a symlink.** `cp` replaces the contents of whatever a
+destination link points at and leaves the link in place — as root, against
+`app-data/`, which app containers are bind-mounted into, that turns a planted
+symlink into an arbitrary root-owned write. Symlinked destinations are refused,
+the copy lands on a temp file in the destination's own directory and is renamed
+into place, and ownership comes from the containing directory rather than from
+the backup, so a tampered mirror copy cannot choose who owns what replaces the
+original.
 
 It also stops umbreld before restoring `umbrel.yaml`, because umbreld holds that
 file open and rewrites it on shutdown — restoring underneath a running daemon

@@ -8,15 +8,31 @@
 #
 # ── Why this cannot restore an arbitrary path ────────────────────────────────
 # It only ever restores a file the integrity checker has independently
-# diagnosed as damaged on THIS NODE and intact in the mirror. That is not a
-# convenience, it is the safety property: a restore tool that accepts any path
-# is a tool that can overwrite good data with old data, and one that can be
-# pointed outside the data directory entirely. Here the candidate list is
-# computed, never taken from the caller — the argument only selects from it.
+# diagnosed as damaged on THIS NODE and intact in the mirror. The candidate
+# list is computed; the argument selects from it and is validated in its own
+# right. A restore tool that accepts any path can overwrite good data with old
+# data, or be pointed outside the data directory entirely.
 #
-# So there is no path traversal to defend against, no way to "restore" a file
-# that was never broken, and no way to copy from a mirror whose own copy is
-# also garbage. Ask for something not on the list and it says so.
+# An earlier version of this comment claimed selection alone made traversal
+# impossible. It did not. Membership was tested with `grep -qxF "$TARGET"`,
+# and grep -F treats a pattern containing newlines as SEVERAL patterns, any of
+# which may match — so a two-line argument whose first line was a real
+# candidate passed the check, and then every line got restored. A leading
+# newline matched even an EMPTY candidate list, because the here-string
+# supplies one empty line for the empty sub-pattern to match. Membership is an
+# exact string comparison now, and paths are validated whatever list they came
+# from, because a safety property that rests on one clever test is one edit
+# away from not existing.
+#
+# ── Why the copy is not `cp` onto the destination ────────────────────────────
+# cp writes THROUGH an existing destination symlink: it replaces the contents
+# of whatever the link points at and leaves the link in place. Running as root
+# against app-data/, which app containers are bind-mounted into, that turns a
+# planted symlink into an arbitrary root-owned write. So symlinked destinations
+# are refused outright, the copy lands on a temp file in the destination's own
+# directory and is renamed into place, and ownership comes from the containing
+# directory rather than from the mirror — a hostile source file should not get
+# to choose who owns what replaces it.
 #
 # ── Why umbreld gets stopped ─────────────────────────────────────────────────
 # umbrel.yaml is held open by umbreld, which rewrites it on shutdown. Restoring
@@ -47,6 +63,29 @@ UMBREL_SRC="${UMBREL_DIR:-/home/umbrel/umbrel}"
 DEST_BASE="${BACKUP_PATH:-}"
 SCOPE="${BACKUP_SCOPE:-essential}"
 
+# A plain relative path inside the data directory, and nothing else. Rejects
+# absolute paths, "..", and anything outside a conservative character set —
+# which also excludes the newline that defeated the old membership test.
+safe_relpath() {
+    local rel="$1" part
+    [ -n "$rel" ] || return 1
+    case "$rel" in /*) return 1 ;; esac
+    [[ "$rel" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
+    while IFS= read -r part; do
+        [ "$part" = ".." ] && return 1
+    done < <(printf '%s\n' "$rel" | tr '/' '\n')
+    return 0
+}
+
+# Exact membership, one line at a time. grep -qxF looked equivalent and was not.
+is_candidate() {
+    local want="$1" line
+    while IFS= read -r line; do
+        [ -n "$line" ] && [ "$line" = "$want" ] && return 0
+    done <<< "${CANDIDATES:-}"
+    return 1
+}
+
 MODE="one"
 TARGET=""
 case "${1:-}" in
@@ -56,6 +95,11 @@ case "${1:-}" in
     -*)     echo "Usage: $0 [--list|--all|<path>]" >&2; exit 2 ;;
     *)      TARGET="$1" ;;
 esac
+
+if [ "$MODE" = "one" ] && ! safe_relpath "$TARGET"; then
+    echo "❌ '$TARGET' is not a plain relative path inside the data directory." >&2
+    exit 2
+fi
 
 if [ -z "$DEST_BASE" ]; then
     echo "ℹ️ Backups are not configured, so there is nothing to restore from."
@@ -110,7 +154,7 @@ fi
 # when someone asked for a specific file would report success for work that did
 # not happen, and leave them believing a broken file was fixed.
 if [ "$MODE" = "one" ]; then
-    if ! grep -qxF "$TARGET" <<< "${CANDIDATES:-}"; then
+    if ! is_candidate "$TARGET"; then
         case "$(verdict_for "$TARGET")" in
             mirror)
                 echo "❌ '$TARGET' is damaged in the BACKUP, not on this node."
@@ -139,7 +183,7 @@ fi
 # umbrel.yaml is rewritten by umbreld on shutdown, so restoring it under a live
 # daemon means losing the good copy again minutes later.
 NEEDS_UMBRELD_STOP=false
-grep -qxF "umbrel.yaml" <<< "$CANDIDATES" && NEEDS_UMBRELD_STOP=true
+is_candidate "umbrel.yaml" && NEEDS_UMBRELD_STOP=true
 
 UMBRELD_WAS_RUNNING=false
 if [ "$NEEDS_UMBRELD_STOP" = true ]; then
@@ -158,9 +202,43 @@ fi
 mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 RESTORED=0
 FAILED=0
+SRC_REAL="$(realpath -e "$UMBREL_SRC" 2>/dev/null || printf '%s' "$UMBREL_SRC")"
+
+# Replace a file without ever writing through a link. Returns 2 when the
+# destination, or any directory on the way to it, is a symlink or resolves
+# outside the data directory.
+install_file() {
+    local src="$1" dst="$2" dir real tmp
+    dir="$(dirname "$dst")"
+    [ -d "$dir" ] || return 1
+    [ -L "$dst" ] && return 2
+    # realpath resolves every component, so a symlinked PARENT is caught too.
+    real="$(realpath -e "$dir" 2>/dev/null)" || return 1
+    case "$real/" in
+        "$SRC_REAL"/*) ;;
+        *) return 2 ;;
+    esac
+    tmp="$(mktemp "$dir/.guardian-restore.XXXXXX" 2>/dev/null)" || return 1
+    # Deliberately not --preserve=ownership: the mirror copy is the thing that
+    # may have been tampered with, and it does not get to decide who owns the
+    # file that replaces the original.
+    if ! cp --preserve=mode,timestamps "$src" "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; return 1
+    fi
+    chown --reference="$dir" "$tmp" 2>/dev/null || true
+    # rename(2) over the destination: atomic, and it cannot traverse a link.
+    mv -T "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    return 0
+}
 
 while IFS= read -r REL; do
     [ -n "$REL" ] || continue
+    # Re-validated here as well as at the argument, so --all is protected no
+    # matter how the candidate list was built.
+    if ! safe_relpath "$REL"; then
+        echo "❌ $REL: refused, not a plain path inside the data directory"
+        FAILED=$((FAILED + 1)); continue
+    fi
     SRC="$MIRROR/$REL"
     DST="$UMBREL_SRC/$REL"
 
@@ -171,15 +249,22 @@ while IFS= read -r REL; do
 
     # Keep the broken copy. It costs a few kilobytes and it is the only
     # evidence of what went wrong if the restore turns out to be the wrong call.
-    if [ -f "$DST" ]; then
+    # -P so a symlinked original is preserved as a link rather than followed;
+    # this keeps the evidence honest and avoids reading through it as root.
+    if [ -e "$DST" ] || [ -L "$DST" ]; then
         KEEP="$BACKUP_DIR/$(echo "$REL" | tr '/' '_').$(date +%Y%m%d-%H%M%S).broken"
-        cp -a "$DST" "$KEEP" 2>/dev/null || true
+        cp -P --preserve=mode,timestamps "$DST" "$KEEP" 2>/dev/null || true
     fi
 
-    if ! cp -a "$SRC" "$DST" 2>/dev/null; then
-        echo "❌ $REL: could not write (permission denied?) — skipped"
-        FAILED=$((FAILED + 1)); continue
-    fi
+    install_file "$SRC" "$DST"
+    case $? in
+        0) ;;
+        2) echo "❌ $REL: destination is a symlink or resolves outside $UMBREL_SRC — refused"
+           echo "   A restore must not write through a link. Remove it and re-run."
+           FAILED=$((FAILED + 1)); continue ;;
+        *) echo "❌ $REL: could not write (permission denied?) — skipped"
+           FAILED=$((FAILED + 1)); continue ;;
+    esac
 
     # Verify what actually landed. A copy that succeeded and produced an
     # unreadable file is worse than no restore at all, because it looks done.
