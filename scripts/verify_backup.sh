@@ -58,12 +58,21 @@ SCOPE="${BACKUP_SCOPE:-essential}"
 # A fresh install with no drive is a normal state, not a fault. Say so plainly
 # instead of emitting errors about a path that was never meant to exist.
 if [ -z "$DEST_BASE" ]; then
+    # --integrity feeds health_check.sh, whose contract is one deterministic
+    # line per PROBLEM. Human prose here would be appended to its issue list
+    # verbatim — turning "you have no backup drive" into a permanent two-line
+    # Telegram alert on every node that never configured one. This mode answers
+    # one question, "is anything corrupt", and having nothing to inspect is not
+    # a corruption finding. Mount and configuration state belong to the checks
+    # that already own them.
+    [ "$MODE" = "integrity" ] && exit 0
     echo "ℹ️ Backups are not configured (BACKUP_PATH is empty in config.env)."
     echo "   Re-run install.sh to set up a backup drive."
     exit 0
 fi
 
 if ! mountpoint -q "$DEST_BASE" 2>/dev/null; then
+    [ "$MODE" = "integrity" ] && exit 0
     echo "❌ Backup drive is NOT mounted at $DEST_BASE"
     echo "   Nothing is being backed up. Plug the drive in, or run:"
     echo "   sudo /usr/local/bin/mount-umbrel-backup.sh"
