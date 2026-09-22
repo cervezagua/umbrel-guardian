@@ -34,6 +34,14 @@ refuse() {
     exit 2
 }
 
+# Resolved once, explicitly, so a failure says which binary was not found
+# rather than surfacing as a bare exec error. sudo replaces PATH with
+# secure_path from /etc/sudoers (Debian ships /usr/local/bin in it, which is
+# where umbrelOS's `npm link` puts umbreld), so this is a lookup in a trusted
+# path — not one the caller can steer.
+UMBRELD="$(command -v umbreld 2>/dev/null || true)"
+[ -n "$UMBRELD" ] || refuse "umbreld not found on PATH ($PATH)"
+
 PROC="${1:-}"
 [ -n "$PROC" ] || refuse "no procedure given"
 shift
@@ -44,7 +52,7 @@ case "$PROC" in
     apps.list.query|notifications.get.query|system.version.query|\
     system.checkUpdate.query|system.getReleaseChannel.query)
         [ "$#" -eq 0 ] || refuse "$PROC takes no arguments"
-        exec umbreld client "$PROC"
+        exec "$UMBRELD" client "$PROC"
         ;;
 
     # The one mutation Guardian performs. Restricted to a single flag and an
@@ -53,7 +61,7 @@ case "$PROC" in
     apps.restart.mutate)
         [ "$#" -eq 2 ] && [ "$1" = "--appId" ] || refuse "usage: apps.restart.mutate --appId <id>"
         [[ "$2" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ ]] || refuse "invalid app id"
-        exec umbreld client apps.restart.mutate --appId "$2"
+        exec "$UMBRELD" client apps.restart.mutate --appId "$2"
         ;;
 
     # Notably absent: notifications.clear.mutate, which would remove a notice
