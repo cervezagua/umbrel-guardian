@@ -427,6 +427,7 @@ umbrel-guardian/
 │   ├── umbrel_notifications.sh ← Relay umbrelOS notifications to Telegram
 │   ├── umbrel_update_check.sh  ← Update alerts + post-OTA self-check
 │   ├── storage_usage.sh        ← Per-app storage usage
+│   ├── boot-marker.sh          ← Arms the clean-shutdown marker and judges the last power-off
 │   ├── system_control.sh       ← Privileged reboot/shutdown/restart wrapper (sudo)
 │   └── mount-backup.sh         ← Mount backup drive (udev + boot + safety net)
 │

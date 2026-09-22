@@ -8,10 +8,17 @@
 # single day, with the kernel logging no I/O error at all because nothing
 # actually failed. The write simply never finished.
 #
-# So the answer is recorded rather than inferred. ExecStart drops a marker when
-# the machine comes up; ExecStop removes it when systemd shuts down in an
-# orderly way. A marker still present at the next boot means the previous one
-# never got to run — the plug was pulled.
+# So the answer is recorded rather than inferred. ExecStart writes the current
+# boot id into a marker; ExecStop removes it when systemd shuts down in an
+# orderly way. A marker still present at the next boot, carrying a DIFFERENT
+# boot id, means ExecStop never got to run — the plug was pulled.
+#
+# The boot id is what makes it a real test. An earlier version just touched an
+# empty file, so presence alone was the signal — but the marker is present for
+# the whole time the machine is up, by design. Anything that asked "does the
+# marker exist?" outside of early boot got the answer "unclean" every time.
+# ExecStart does the comparison itself (see scripts/boot-marker.sh) so nothing
+# else has to win a race against it to reach the right verdict.
 #
 # DefaultDependencies=no with Conflicts/Before=shutdown.target is what makes
 # ExecStop actually run during shutdown rather than being torn down with
@@ -26,9 +33,8 @@ Conflicts=shutdown.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/mkdir -p /home/umbrel/umbrel/umbrel-guardian/.state
-ExecStartPost=/bin/touch /home/umbrel/umbrel/umbrel-guardian/.state/boot-in-progress
-ExecStop=/bin/rm -f /home/umbrel/umbrel/umbrel-guardian/.state/boot-in-progress
+ExecStart=/home/umbrel/umbrel/umbrel-guardian/scripts/boot-marker.sh --arm
+ExecStop=/home/umbrel/umbrel/umbrel-guardian/scripts/boot-marker.sh --disarm
 
 [Install]
 WantedBy=multi-user.target

@@ -131,29 +131,21 @@ if getent group docker &>/dev/null; then
 fi
 
 # ── Was the last shutdown clean? ─────────────────────────────────────────────
-# Checked here, at pre-start, because this runs before the marker unit re-arms
-# for the current boot. A marker left over from last time means ExecStop never
-# ran — the machine lost power instead of shutting down.
+# NOT decided here. It used to be, and it was wrong in both directions.
 #
-# This is not a footnote. An unclean power-off while umbreld is mid-write
-# leaves a file with the right size, the right timestamp and null bytes inside,
-# and the kernel logs no I/O error because nothing failed — the write just
-# never finished. It is the single most likely cause of config corruption on an
-# SD card, and it is entirely preventable by shutting down properly. Nothing in
-# umbrelOS tells you it happened.
+# The marker is created when the machine comes up and removed at orderly
+# shutdown, so it is present for the entire time the system is running — that is
+# its job. Testing `[ -e marker ]` from this script therefore reported a power
+# loss on every manual reinstall of a perfectly healthy node, and stamped it with
+# the live boot id so the health timer pushed the alert to Telegram. And in the
+# other direction, nothing ordered the marker unit against this hook, so at real
+# boot the marker could be re-created before this script ever read it, losing a
+# genuine detection.
 #
-# The verdict is stamped with the current boot id so the alert describes THIS
-# boot and disappears after the next clean one, instead of accusing you forever.
-BOOT_MARKER="$STATE_DIR/boot-in-progress"
-UNCLEAN_FILE="$STATE_DIR/unclean-shutdown"
+# The verdict now belongs to the unit that owns the marker: the marker records
+# WHICH boot wrote it, and umbrel-guardian-cleanshutdown.service compares boot
+# ids in its own ExecStart. See scripts/boot-marker.sh.
 mkdir -p "$STATE_DIR" 2>/dev/null || true
-if [ -e "$BOOT_MARKER" ]; then
-    printf '%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)" \
-        > "$UNCLEAN_FILE" 2>/dev/null || true
-    echo "  ⚠️ Previous shutdown was unclean (power loss?) — flagged for alerting"
-else
-    rm -f "$UNCLEAN_FILE" 2>/dev/null || true
-fi
 chown -R umbrel:umbrel "$STATE_DIR" 2>/dev/null || true
 
 # ── Cap the journal ──────────────────────────────────────────────────────────
@@ -178,7 +170,11 @@ JOURNAL_EOF
     # Only vacuum when actually over the cap. Vacuuming is slow on a large
     # journal and this hook shares a 5-minute budget with everything else, so
     # it is bounded and its failure is never fatal.
-    JOURNAL_NOW=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]?B?' | tail -1 || true)
+    # `[0-9.]+` matches a lone "." and journald's sentence ends with one, so
+    # with `tail -1` this reported the size as "." — "Journal capped at 200M
+    # (was .)" on a live node. Require a leading digit and take the FIRST match:
+    # "Archived and active journals take up 1.8G in the file system."
+    JOURNAL_NOW=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?[KMGTPE]?B?' | head -1 || true)
     if timeout 120 journalctl --vacuum-size="$JOURNAL_MAX" &>/dev/null; then
         echo "  ✅ Journal capped at $JOURNAL_MAX (was ${JOURNAL_NOW:-unknown})"
     else
