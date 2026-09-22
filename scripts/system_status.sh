@@ -33,9 +33,12 @@ CPU=$(uptime | awk -F'load average:' '{print $2}' | xargs)
 UPTIME_STR=$(uptime -p 2>/dev/null || uptime)
 
 # App count (non-fatal if umbreld is unavailable)
-APP_COUNT="?"
+# Distinguishable on purpose: a bare "?" reads like a cosmetic glitch, and a
+# number that is silently wrong is worse than an admission. A failed query
+# is not an app count of unknown size, it is a failed query.
+APP_COUNT="unknown (umbreld did not answer)"
 if command -v umbreld &>/dev/null; then
-    _RAW=$(guardian_umbreld 45 apps.list.query 2>&1) || true
+    _RAW=$(guardian_umbreld "$GUARDIAN_UMBRELD_TIMEOUT" apps.list.query 2>&1) || true
     APP_COUNT=$(echo "$_RAW" | python3 -c "
 import sys, json
 raw = sys.stdin.read()
@@ -47,7 +50,15 @@ except (json.JSONDecodeError, ValueError):
     if idx == -1: sys.exit(1)
     apps, _ = decoder.raw_decode(raw, idx)
 print(len(apps))
-" 2>/dev/null) || APP_COUNT="?"
+" 2>/dev/null) || APP_COUNT=""
+    # A bare number is the only thing worth trusting here. Anything else means
+    # the query did not answer, and the line below says so rather than printing
+    # a count nobody established.
+    if [[ "$APP_COUNT" =~ ^[0-9]+$ ]]; then
+        APP_COUNT="$APP_COUNT installed"
+    else
+        APP_COUNT="unknown (umbreld did not answer)"
+    fi
 fi
 
 echo "🖥 Umbrel System Status
@@ -56,4 +67,4 @@ echo "🖥 Umbrel System Status
 💾 Disk (${DISK_LABEL}): ${DISK_LINE}
 🧠 RAM:      ${RAM}
 ⚡ CPU load: ${CPU}
-📦 Apps:     ${APP_COUNT} installed"
+📦 Apps:     ${APP_COUNT}"

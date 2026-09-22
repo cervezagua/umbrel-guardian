@@ -42,7 +42,7 @@ fi
 #      its dash-substituted form), use it. Lets `/restart adguard` → adguard-home.
 #   4. If multiple prefix matches, report them all so the user can be specific.
 # Capture all output (stdout + stderr) — umbreld may write JSON to either.
-RAW=$(guardian_umbreld 45 apps.list.query 2>&1) || true
+RAW=$(guardian_umbreld "$GUARDIAN_UMBRELD_TIMEOUT" apps.list.query 2>&1) || true
 RESPONSE=$(echo "$RAW" | python3 -c "
 import sys, json
 

@@ -457,7 +457,7 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
         send_message(token, chat_id, HELP_TEXT, parse_mode="MarkdownV2")
 
     elif lower == "/status":
-        out = run_script("system_status.sh", timeout=90)
+        out = run_script("system_status.sh", timeout=150)
         send_message(token, chat_id, out)
 
     elif lower == "/uptime":
@@ -487,7 +487,7 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
             send_message(token, chat_id, out)
 
     elif lower == "/apps":
-        out = run_script("apps_status.sh", timeout=90)
+        out = run_script("apps_status.sh", timeout=150)
         send_message(token, chat_id, out)
 
     elif lower.startswith("/restart"):
@@ -590,10 +590,10 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
             send_message(token, chat_id, run_privileged_script("verify_backup.sh"))
 
     elif lower == "/notifications":
-        send_message(token, chat_id, run_script("umbrel_notifications.sh", "--list", timeout=90))
+        send_message(token, chat_id, run_script("umbrel_notifications.sh", "--list", timeout=150))
 
     elif lower == "/updates":
-        send_message(token, chat_id, run_script("umbrel_update_check.sh", "--report", timeout=90))
+        send_message(token, chat_id, run_script("umbrel_update_check.sh", "--report", timeout=150))
 
     elif lower == "/storage":
         # Was already written and working, just never wired to anything.

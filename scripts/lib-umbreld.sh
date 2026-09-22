@@ -13,6 +13,23 @@
 
 GUARDIAN_UMBRELD_WRAPPER="${GUARDIAN_UMBRELD_WRAPPER:-/usr/local/lib/umbrel-guardian/umbreld-query.sh}"
 
+# 90s, and that is not paranoia. Measured on a Raspberry Pi 4 running umbrelOS
+# 2.0.0, one `system.version.query`:
+#
+#   unconstrained                19.2 s
+#   inside CPUQuota=20%         110.0 s
+#   inside MemoryMax=128M        10.1 s   (memory is not a factor)
+#
+# The 19.2 s baseline is the surprise. The same call on 1.7.4 took 1.8 s. 2.0's
+# CLI opens a WebSocket and mints a ticket via user.createWebSocketTicket before
+# every query, so there are several round trips where there used to be one —
+# roughly a tenfold cost increase with no code change on our side. The old 45 s
+# budget was sized against 1.7.4 and every umbreld-backed command timed out on
+# 2.0 at exactly 42-46 s.
+#
+# One number, in one place, so the next version's surprise is a one-line change.
+GUARDIAN_UMBRELD_TIMEOUT="${GUARDIAN_UMBRELD_TIMEOUT:-90}"
+
 # guardian_umbreld <timeout-seconds> <procedure> [args...]
 # stdout is umbreld's output; stderr is merged in by callers that want it.
 guardian_umbreld() {

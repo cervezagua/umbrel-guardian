@@ -51,7 +51,7 @@ UMBRELD_BIN="${UMBRELD_BIN:-umbreld}"
 # 1.8s unconstrained, 19.25s under that quota — a 10x multiplier. A 10s timeout
 # is therefore guaranteed to fail from the bot while passing every test run from
 # a shell, which is exactly how this shipped.
-UMBRELD_TIMEOUT=45
+UMBRELD_TIMEOUT="$GUARDIAN_UMBRELD_TIMEOUT"
 # How long between network update checks. Six hours is far more often than
 # umbrelOS ships, and keeps the timer from making an outbound call every 30
 # minutes for an answer that changes a few times a year.

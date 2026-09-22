@@ -27,7 +27,18 @@ MemoryMax=128M
 # and the bot allows 90s for the commands that make such a call. The limit stays
 # because a runaway bot must not be able to starve a Bitcoin node — the answer is
 # realistic timeouts, not a weaker sandbox.
-CPUQuota=20%
+# 100%, i.e. one core. 20% was strangling the thing it exists to protect.
+# Measured on a Pi 4 running umbrelOS 2.0, one umbreld query: 19.2s
+# unconstrained, 110s inside CPUQuota=20%. Since cgroup limits apply to
+# everything the unit spawns — sudo does not escape them — every umbreld-backed
+# command timed out, while the identical command from a shell worked fine.
+#
+# The quota was meant to stop the bot starving a small Pi. But the bot is idle
+# almost all the time and only needs CPU during the few seconds it is actually
+# answering you, so throttling it punishes exactly the moment it is useful.
+# MemoryMax below is the limit that actually contains it; 10.1s under a 128M
+# cap in the same test shows memory was never the constraint.
+CPUQuota=100%
 # NOTE: NoNewPrivileges is intentionally NOT set — the bot uses `sudo -n` to
 # invoke scripts/system_control.sh for /system_reboot, /system_shutdown,
 # /restart_docker, /restart_umbrel. Sudo needs setuid to escalate to root,

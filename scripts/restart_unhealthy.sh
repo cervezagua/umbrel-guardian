@@ -35,7 +35,7 @@ if ! command -v umbreld &>/dev/null; then
 fi
 
 # Capture all output (stdout + stderr) — umbreld may write JSON to either.
-RAW=$(guardian_umbreld 45 apps.list.query 2>&1) || true
+RAW=$(guardian_umbreld "$GUARDIAN_UMBRELD_TIMEOUT" apps.list.query 2>&1) || true
 
 UNHEALTHY=$(echo "$RAW" | python3 -c "
 import sys, json

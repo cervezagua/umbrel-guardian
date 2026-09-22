@@ -116,6 +116,33 @@ whether the app's `docker-compose.yml` still parses — umbreld rewrites that fi
 on every start, so it is the file most likely to be caught mid-write by a
 stalling drive.
 
+### umbrelOS 2.0 is much slower to talk to
+
+Measured on a Raspberry Pi 4 running umbrelOS 2.0.0, one `system.version.query`:
+
+| condition | time |
+|---|---|
+| unconstrained | **19.2 s** |
+| inside `CPUQuota=20%` | **110 s** |
+| inside `MemoryMax=128M` | 10.1 s |
+
+The same call on 1.7.4 took **1.8 s**. 2.0's CLI opens a WebSocket and mints a
+ticket via `user.createWebSocketTicket` before every query, so there are several
+round trips where there used to be one — roughly a tenfold cost increase with no
+change on Guardian's side.
+
+Two consequences, both fixed here:
+
+- **The bot's `CPUQuota` was 20%**, and cgroup limits apply to everything a unit
+  spawns — `sudo` does not escape them. So every umbreld-backed command timed out
+  from Telegram while the identical command worked from a shell. It is 100% now:
+  the bot is idle almost all the time and only needs CPU during the seconds it is
+  answering you, so throttling it punished exactly the moment it was useful.
+  `MemoryMax` is what actually contains it, and memory was never the constraint.
+- **Timeouts were sized against 1.7.4.** There is now one value,
+  `GUARDIAN_UMBRELD_TIMEOUT` in `scripts/lib-umbreld.sh`, so the next version's
+  surprise is a one-line change rather than seven.
+
 ### umbrelOS 2.0 and the root-only CLI
 
 umbrelOS 2.0 made `umbreld client` root-only. From its own
