@@ -139,7 +139,16 @@ def main():
         if not src_bad and not mir_bad:
             continue
 
-        verdict = "both" if src_bad and mir_bad else ("source" if src_bad else "mirror")
+        # "source" promises the mirror holds a good copy, and restore_file.sh
+        # takes that literally when building its candidate list. A file damaged
+        # here whose backup copy is merely ABSENT is not restorable, and saying
+        # so up front beats offering it and failing at the copy.
+        if src_bad and mir_bad:
+            verdict = "both"
+        elif src_bad:
+            verdict = "source" if mir_state == "ok" else "source-nobackup"
+        else:
+            verdict = "mirror"
         detail = src_detail or mir_detail or ""
         print("BAD\t%s\t%s\t%s\t%s\t%s" % (rel, verdict, src_state, mir_state, detail))
     return 0

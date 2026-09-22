@@ -116,6 +116,10 @@ if [ "$MODE" = "one" ]; then
                 echo "❌ '$TARGET' is damaged in the BACKUP, not on this node."
                 echo "   This node has the good copy. Restoring would overwrite it with"
                 echo "   the broken one. Run a backup instead to replace the bad copy." ;;
+            source-nobackup)
+                echo "❌ '$TARGET' is damaged on this node but is not in the backup at all."
+                echo "   Nothing to restore from. If it is an app config, umbrelOS can"
+                echo "   regenerate it from the app store template." ;;
             both)
                 echo "❌ '$TARGET' is damaged on this node AND in the backup."
                 echo "   There is no good copy to restore from. For an app config, umbrelOS"

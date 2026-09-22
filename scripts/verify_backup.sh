@@ -210,6 +210,8 @@ INTEGRITY_CHECKER="$SCRIPT_DIR/lib-integrity.py"
 integrity_line() {
     case "$2" in
         source) echo "🚨 $1 is damaged on this node — the backup copy is good, restore it" ;;
+        source-nobackup)
+                echo "🚨 $1 is damaged on this node and is NOT in the backup — no copy to restore from" ;;
         mirror) echo "🚨 $1 is damaged in the BACKUP — the node is fine, run a backup to replace it" ;;
         both)   echo "🚨 $1 is damaged on the node AND in the backup — rebuild it from the app store" ;;
     esac
