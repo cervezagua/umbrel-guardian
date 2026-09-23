@@ -21,7 +21,6 @@ Runs directly on the host — no Umbrel app store required, no modifications to 
 <img width="208" height="320" alt="Terminal_ss" src="https://github.com/user-attachments/assets/f445b626-9a86-4100-b751-243bfddddc76" />
 
 
-
 ## 📋 Requirements
 
 - Umbrel OS (tested on **Umbrel 1.7.2**, Raspberry Pi 5 8 GB; compatible with 1.5+)
@@ -167,123 +166,6 @@ whether the app's `docker-compose.yml` still parses — umbreld rewrites that fi
 on every start, so it is the file most likely to be caught mid-write by a
 stalling drive.
 
-### umbrelOS 2.0 is much slower to talk to
-
-Measured on a Raspberry Pi 4 running umbrelOS 2.0.0, one `system.version.query`:
-
-| condition | time |
-|---|---|
-| unconstrained | **19.2 s** |
-| inside `CPUQuota=20%` | **110 s** |
-| inside `MemoryMax=128M` | 10.1 s |
-
-> That last row measures one query in a throwaway scope, and it is **not**
-> evidence that the memory limit was harmless — an earlier draft of this section
-> said it was. The live bot's own cgroup reported `memory.events` `max=605`:
-> 605 times it reached the 128 M ceiling and the kernel reclaimed to stay under
-> it. Nothing was OOM-killed, but the limit was binding constantly. See
-> [Resource limits on small hardware](#resource-limits-on-small-hardware).
-
-The same call on 1.7.4 took **1.8 s**. 2.0's CLI opens a WebSocket and mints a
-ticket via `user.createWebSocketTicket` before every query, so there are several
-round trips where there used to be one — roughly a tenfold cost increase with no
-change on Guardian's side.
-
-Two consequences, both fixed here:
-
-- **The bot's `CPUQuota` was 20%**, and cgroup limits apply to everything a unit
-  spawns — `sudo` does not escape them. So every umbreld-backed command timed out
-  from Telegram while the identical command worked from a shell. The quota is now
-  a ceiling of one core with a low `CPUWeight` underneath it, which is the
-  primitive that was wanted all along; see
-  [Resource limits on small hardware](#resource-limits-on-small-hardware).
-- **Timeouts were sized against 1.7.4.** There is now one value,
-  `GUARDIAN_UMBRELD_TIMEOUT` in `scripts/lib-umbreld.sh`, so the next version's
-  surprise is a one-line change rather than seven.
-
-### Resource limits on small hardware
-
-The reference node for these numbers is a Raspberry Pi 4 — 4 GB of RAM, four
-cores — running Bitcoin, Electrs and Monero, which between them hold about
-2.5 GB resident before Guardian starts. Guardian has to be invisible on that
-machine. The limits live in `services/umbrel-guardian-bot.service`:
-
-| directive | value | what it does |
-|---|---|---|
-| `CPUQuota` | `100%` | Ceiling. On four cores, **one core — a quarter of the machine**, not "unlimited". |
-| `CPUWeight` | `20` | Share, and only when the cores are contended. Default is 100, so the bot gets about a fifth of a normal neighbour's share under load. |
-| `MemoryHigh` | `96M` | Throttle and reclaim. The everyday ceiling. |
-| `MemoryMax` | `192M` | Hard kill. The emergency ceiling — 4.7% of this node's RAM. |
-| `OOMPolicy` | `continue` | An OOM-killed child does not take the whole bot down. |
-
-**Why both a quota and a weight.** A quota is enforced whether or not anybody
-else wants the CPU, so `CPUQuota=20%` held the bot to a fifth of a core even on
-a completely idle machine — which is how a 19.2 s umbreld query became 110 s and
-every umbreld-backed Telegram command timed out. A weight costs nothing when
-nothing else is asking and yields when something is. "Get out of Bitcoin's way"
-is a weight, not a quota. The quota stays as a ceiling on a runaway bot, which
-is the only thing a ceiling was ever good for.
-
-**Why the memory limit went up.** `MemoryMax` alone answers a transient spike
-with `SIGKILL`, and this cgroup holds both the Python bot and the Node process
-`umbreld client` spawns underneath it — together they brush 128 M on umbrelOS
-2.0. `MemoryHigh` reclaims first and kills only for a genuine leak, so the
-typical footprint is *lower* than before (96 M rather than 128 M) and only the
-emergency ceiling is higher.
-
-**Checking it on your own node.** Ask the kernel rather than guessing:
-
-```bash
-# Peak memory this service has ever used, and whether it hit a limit
-systemctl show umbrel-guardian-bot -p MemoryPeak -p MemoryCurrent
-cat /sys/fs/cgroup/system.slice/umbrel-guardian-bot.service/memory.events
-```
-
-In `memory.events`, `high` counts throttle events and `max` counts times the
-hard limit was hit; `oom_kill` above zero means something was actually killed.
-All three at `0` means the limits are never being reached and nothing needs
-tuning.
-
-### umbrelOS 2.0 and the root-only CLI
-
-umbrelOS 2.0 made `umbreld client` root-only. From its own
-`modules/cli-client.ts`:
-
-> This credential deliberately lives below a 0700 auth directory as a 0600
-> file. The production CLI is therefore root-only; loosening the file mode
-> would turn local shell access into full umbreld API access.
-
-Every Guardian script that asks umbreld anything runs as the `umbrel` user, so
-without a change all of these break on 2.0: `/apps`, `/status`, `/health`,
-`/restart`, `/notifications` and `/updates`.
-
-The lazy fix is a sudoers grant per script, which hands `umbrel` precisely the
-"full umbreld API access" that comment is guarding against — through the side
-door, with Guardian holding it open. So the grant is for a **gateway** instead:
-
-```
-scripts/umbreld-query.sh  →  /usr/local/lib/umbrel-guardian/umbreld-query.sh
-```
-
-It allows six procedures and nothing else — five read-only queries that take no
-arguments, plus `apps.restart.mutate` with an app id it validates against
-umbrelOS's own format. The result is **tighter than 1.7.4**, where `umbrel`
-could already run `umbreld client <anything>` unaided. `notifications.clear.mutate`
-is deliberately unreachable: clearing removes a notice from the dashboard for
-everyone, and Guardian is read-only about notifications by design.
-
-It is deployed **outside** `$INSTALL_DIR`, as `root:root` mode 0755, because a
-sudo-granted script its own caller can rewrite is not a privilege boundary —
-and everything under `/home/umbrel` is writable by `umbrel`. It has no config,
-libraries or state beside it, so there is nothing alongside it to subvert
-either.
-
-> **Still outstanding:** the *other* sudo-granted scripts (`system_control.sh`,
-> `disk_health.sh`, `verify_backup.sh`, `restore_file.sh`) do still live in an
-> `umbrel`-writable directory. That is a pre-existing weakness, not one 2.0
-> introduced, and moving them needs the installer to separate code from config
-> and state. It is the next piece of work, not a solved problem.
-
 ### Restoring a damaged file
 
 When the integrity check finds a file damaged here but intact in the backup,
@@ -324,113 +206,6 @@ all.
 
 `/restore` is blocked by `/lock`. Every other bot command is read-only; this one
 writes to your data directory, which is exactly what safe mode is for.
-
-### Why verification parses instead of comparing
-
-A backup check that compares the mirror against the source cannot see
-corruption. rsync faithfully copies a file whose contents have been destroyed,
-and afterwards both sides agree — so the comparison reports success while the
-backup holds garbage.
-
-That is not hypothetical. On the node this was built for, a failing SD card
-null-filled five `docker-compose.yml` files. `rsync` copied them. `/verify_backup`
-reported **"looks restorable"** while every one of those files in the backup was
-unusable, because the mirror matched the source perfectly.
-
-So `/verify_backup` now **parses** the files umbrelOS cannot start without —
-`umbrel.yaml`, every `app-data/*/settings.yml`, every
-`app-data/*/docker-compose.yml` — on each side independently, and reports which
-side is damaged. That distinction is the whole point, because the remedy is
-different each time:
-
-| Finding | What it means | What to do |
-|---|---|---|
-| Damaged on the node, good in the backup | The node is broken | Restore that file from the mirror |
-| Good on the node, damaged in the backup | The backup can't restore it | Run a backup to replace it |
-| Damaged on both sides | Neither copy is usable | Rebuild it from the app store template |
-
-Three details this earned the hard way:
-
-- **Parsing, not byte-scanning.** A scan for NUL bytes was tried first and
-  passed a file full of other non-printable garbage; the app stayed broken while
-  the check called it clean. "Can umbreld read this?" is the only question worth
-  asking, and parsing is the only way to ask it.
-- **Valid YAML can still be empty of what matters.** `umbrel.yaml` parsed
-  perfectly on a node whose entire `user` block — account, password hash, 2FA
-  secret — had vanished. Structure is checked, not just syntax.
-- **Unreadable is never reported as damaged.** A permission error is a probe
-  failure. Conflating the two sends you chasing a file that is perfectly fine,
-  which happened once already.
-
-The same check runs on the health timer, so corruption reaches Telegram on its
-own rather than waiting for you to ask. And a check that *could not run* never
-reports "clean" — it says it could not run.
-
-### Disk health, and why it reads the ring buffer
-
-`/disk_health` reads the **kernel ring buffer** (`dmesg`), not journald. That is
-a correctness decision, not a performance one.
-
-journald's logs live on the disk being monitored, so a failing disk makes the
-monitor slow — the tool degrades exactly when the thing it watches gets worse,
-which is the one moment it has to work. Measured on a live node with 1.8 GB of
-journal on an SD card throwing I/O errors:
-
-| query | time |
-|---|---|
-| `journalctl -k --since "7 days ago"` | 75 s |
-| the same with `--grep` (17 lines instead of 4125) | 75 s |
-| `journalctl -k -n 1` — just asking where the journal *ends* | **over 60 s** |
-
-The ring buffer is in RAM. It costs nothing and cannot be slowed down by a dying
-card. On an idle node it holds far more than the 30 minutes between checks.
-
-What it does not hold is history from before the current boot — and that is what
-`.state/` is for. Counts accumulate in `.state/disk-health.counts`, deduplicated
-by a monotonic-clock watermark in `.state/disk-health.dmesg` so the same buffer
-is never counted twice, and the latch persists across reboots even though the
-buffer does not. What Guardian observes once, it remembers for good.
-
-Counts are reported as order-of-magnitude buckets (1+, 10+, 100+, 1000+) that
-never decay. A drive that threw errors last week is still that drive, so the
-alert does not clear itself when the buffer goes quiet.
-
-**Pre-install history.** On its first run Guardian makes one short (20 s) attempt
-to read older errors out of journald, records the outcome, and never retries
-automatically. If your journal is too slow to answer, the report says so and
-live monitoring is unaffected. To pay that cost deliberately:
-
-```bash
-sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --import-history
-```
-
-It reads the whole journal, not just the tail — you asked for it and granted it
-the time — and it is **idempotent**: the imported history is kept in its own
-file (`.state/disk-health.imported`) and each import replaces the last, rather
-than adding to the running total. Two sources, two files, because the arithmetic
-differs: ring-buffer events are seen once and accumulate forever, while a
-history import is a snapshot of a window that overlaps everything it already
-reported. Mixing them would make the number the tool reports climb every time
-you ran the diagnostic.
-
-(A journal that cannot answer in 20 seconds is itself a symptom worth noticing.
-`sudo journalctl --vacuum-size=200M` is usually the fix — but **import first,
-then vacuum**: vacuuming deletes the archived history the import would have
-read.)
-
-**After replacing a drive:**
-
-```bash
-sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --reset
-```
-
-This is deliberately SSH-only, not a bot command — swapping a card already
-requires physical access, and a state-destroying action does not belong on a
-chat interface. As well as clearing the latch, `--reset` **pins the watermark to
-that moment**, so the replacement drive starts from zero instead of inheriting
-its predecessor's errors from whatever is still sitting in the buffer. It reads
-only the ring buffer, so it works on a node whose journal is unusable — which is
-exactly the node you are most likely to be replacing a card on.
 
 ### `/restart` resolution
 
@@ -671,8 +446,8 @@ MemoryMax=192M
 OOMPolicy=continue
 ```
 
-See [Resource limits on small hardware](#resource-limits-on-small-hardware) for
-why those numbers are what they are.
+See [umbrelOS 2.0 timing and resource limits](#umbrelos-20-timing-and-resource-limits)
+for why those numbers are what they are.
 
 > `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands, `disk_health.sh` / `verify_backup.sh` for diagnostics that need root, and `restore_file.sh` to put a damaged file back. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to an explicit list of eighteen exact command lines and nothing else.
 
@@ -819,6 +594,178 @@ Once Umbrel ships a fix, the sidecars come up cleanly and the `partial` warning 
 
 ---
 
+## 🧠 Why it works this way
+
+Four decisions that look wrong until you know what they are avoiding. Read this
+when you want to understand or change how Guardian works; the commands it
+mentions are collected under [Useful Commands](#-useful-commands) too.
+
+### Why verification parses instead of comparing
+
+A backup check that compares the mirror against the source cannot see
+corruption: rsync faithfully copies a file whose contents have been destroyed,
+both sides then agree, and the comparison reports success.
+
+That is not hypothetical. On the node this was built for, a failing SD card
+null-filled five `docker-compose.yml` files, rsync copied them, and
+`/verify_backup` reported **"looks restorable"** while every one of those files in
+the backup was unusable.
+
+So `/verify_backup` **parses** the files umbrelOS cannot start without —
+`umbrel.yaml`, every `app-data/*/settings.yml`, every
+`app-data/*/docker-compose.yml` — on each side independently, and reports which
+side is damaged, because the remedy differs:
+
+| Finding | What to do |
+|---|---|
+| Damaged on the node, good in the backup | Restore that file from the mirror |
+| Good on the node, damaged in the backup | Run a backup to replace it |
+| Damaged on both sides | Rebuild it from the app store template |
+
+Parsing rather than scanning for NUL bytes, because a file can be full of other
+garbage and still fail to load. Structure as well as syntax, because
+`umbrel.yaml` parsed perfectly on a node whose entire `user` block — account,
+password hash, 2FA secret — had vanished. And an unreadable file is reported as a
+probe failure, never as damage, so you are not sent chasing a file that is fine.
+
+The same check runs on the health timer, so corruption reaches Telegram on its
+own rather than waiting for you to ask. A check that *could not run* never
+reports "clean".
+
+### Disk health, and why it reads the ring buffer
+
+`/disk_health` reads the **kernel ring buffer** (`dmesg`), not journald, and that
+is a correctness decision rather than a performance one. journald's logs live on
+the disk being monitored, so a failing disk makes the monitor slow — it would
+degrade exactly when the thing it watches gets worse. On a live node with 1.8 GB
+of journal on an SD card throwing I/O errors, even `journalctl -k -n 1` — just
+asking where the journal ends — took over 60 s. The ring buffer is in RAM and
+cannot be slowed down by a dying card.
+
+What the buffer does not hold is history from before the current boot, so counts
+accumulate in `.state/`, deduplicated by a monotonic-clock watermark so the same
+buffer is never counted twice. They are reported as order-of-magnitude buckets
+(1+, 10+, 100+, 1000+) that never decay: a drive that threw errors last week is
+still that drive, so the alert does not clear itself when the buffer goes quiet.
+
+**Pre-install history.** On its first run Guardian makes one short (20 s) attempt
+to read older errors out of journald, records the outcome, and never retries
+automatically. To pay the full cost deliberately:
+
+```bash
+sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --import-history
+```
+
+This is idempotent: the import is kept in its own file and each one replaces the
+last, so running it twice does not double the total.
+
+> A journal too slow to answer in 20 s is itself a symptom worth noticing.
+> `sudo journalctl --vacuum-size=200M` is usually the fix — but **import first,
+> then vacuum**, because vacuuming deletes the archived history the import reads.
+
+**After replacing a drive:**
+
+```bash
+sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --reset
+```
+
+SSH-only by design: a state-destroying action does not belong on a chat
+interface, and swapping a card already requires physical access. It clears the
+latch and pins the watermark to that moment, so the replacement starts from zero
+instead of inheriting its predecessor's errors out of the buffer. It reads only
+the ring buffer, so it works on a node whose journal is unusable.
+
+### umbrelOS 2.0 timing and resource limits
+
+One `system.version.query` on a Raspberry Pi 4 running umbrelOS 2.0.0:
+
+| condition | time |
+|---|---|
+| unconstrained | **19.2 s** |
+| inside `CPUQuota=20%` | **110 s** |
+
+The same call on 1.7.4 took **1.8 s**. 2.0's CLI opens a WebSocket and mints a
+ticket via `user.createWebSocketTicket` before every query, so anything that
+touches umbreld now costs roughly ten times what it did. If `/apps` or `/status`
+feels slow, that is where the time goes. Every timeout comes from one value,
+`GUARDIAN_UMBRELD_TIMEOUT` in `scripts/lib-umbreld.sh`.
+
+The limits in `services/umbrel-guardian-bot.service` are sized for the weakest
+hardware this runs on — that Pi 4, with Bitcoin, Electrs and Monero already
+holding about 2.5 GB of its 4 GB before Guardian starts:
+
+| directive | value | what it does |
+|---|---|---|
+| `CPUQuota` | `100%` | Ceiling. On four cores, one core — a quarter of the machine, not "unlimited". |
+| `CPUWeight` | `20` | Share, and only when the cores are contended. Default is 100, so the bot yields under load. |
+| `MemoryHigh` | `96M` | Throttle and reclaim. The everyday ceiling. |
+| `MemoryMax` | `192M` | Hard kill. The emergency ceiling — 4.7% of that node's RAM. |
+| `OOMPolicy` | `continue` | An OOM-killed child does not take the whole bot down. |
+
+A quota and a weight do different jobs and the bot needs both. A quota applies
+whether or not anything else wants the CPU, so `CPUQuota=20%` throttled the bot
+on a completely idle machine — that is the 110 s above, and it made every
+umbreld-backed Telegram command time out while the same command worked fine from
+a shell. A weight costs nothing when nothing else is asking and yields when
+something is. The quota remains only to bound a runaway bot.
+
+Memory is two tiers for the same reason: `MemoryMax` alone answers a transient
+spike with `SIGKILL`, and this cgroup holds the Python bot plus the Node process
+`umbreld client` spawns beneath it. Under a single 128 M limit the live bot
+reported `memory.events` `max=605` — 605 times it reached the ceiling and the
+kernel reclaimed to stay under it. `MemoryHigh` reclaims first and kills only for
+a genuine leak.
+
+To check your own node rather than trusting these numbers:
+
+```bash
+systemctl show umbrel-guardian-bot -p MemoryPeak -p MemoryCurrent
+cat /sys/fs/cgroup/system.slice/umbrel-guardian-bot.service/memory.events
+```
+
+In `memory.events`, `high` counts throttles, `max` counts hits on the hard limit,
+and `oom_kill` above zero means something was actually killed. All three at `0`
+means nothing needs tuning.
+
+### umbrelOS 2.0 and the root-only CLI
+
+umbrelOS 2.0 made `umbreld client` root-only. From its own
+`modules/cli-client.ts`:
+
+> This credential deliberately lives below a 0700 auth directory as a 0600
+> file. The production CLI is therefore root-only; loosening the file mode
+> would turn local shell access into full umbreld API access.
+
+Every Guardian script that asks umbreld anything runs as the `umbrel` user, so
+without a change all of these break on 2.0: `/apps`, `/status`, `/health`,
+`/restart`, `/notifications` and `/updates`.
+
+The lazy fix is a sudoers grant per script, which hands `umbrel` precisely the
+"full umbreld API access" that comment guards against, through the side door. So
+the grant is for a **gateway** instead:
+
+```
+scripts/umbreld-query.sh  →  /usr/local/lib/umbrel-guardian/umbreld-query.sh
+```
+
+It allows six procedures and nothing else — five read-only queries that take no
+arguments, plus `apps.restart.mutate` with an app id it validates against
+umbrelOS's own format. The result is **tighter than 1.7.4**, where `umbrel`
+could already run `umbreld client <anything>` unaided. `notifications.clear.mutate`
+is deliberately unreachable: clearing removes a notice from the dashboard for
+everyone, and Guardian is read-only about notifications by design.
+
+It is deployed **outside** `$INSTALL_DIR`, as `root:root` mode 0755, because a
+sudo-granted script its own caller can rewrite is not a privilege boundary — and
+everything under `/home/umbrel` is writable by `umbrel`. It has no config,
+libraries or state beside it either.
+
+> **Still outstanding:** the *other* sudo-granted scripts (`system_control.sh`,
+> `disk_health.sh`, `verify_backup.sh`, `restore_file.sh`) do still live in an
+> `umbrel`-writable directory. That is a pre-existing weakness, not one 2.0
+> introduced, and moving them needs the installer to separate code from config
+> and state. It is the next piece of work, not a solved problem.
+
 ## 🛠 Useful Commands
 
 ```bash
@@ -840,6 +787,16 @@ sudo /usr/local/bin/mount-umbrel-backup.sh
 # ⏱ Check timer schedules
 systemctl list-timers 'umbrel-guardian-*'
 
+# 🩺 Pull pre-install disk errors out of journald (slow, idempotent, one-off)
+#    Do this BEFORE any journalctl --vacuum, which deletes what it would read.
+sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --import-history
+
+# 🔄 After replacing a card or drive — clears the latch and restarts counting
+sudo /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --reset
+
+# 🧠 Is the bot hitting its memory limits? All zeros means nothing needs tuning
+cat /sys/fs/cgroup/system.slice/umbrel-guardian-bot.service/memory.events
+
 # 🔁 Re-install services after OTA update
 sudo bash /home/umbrel/umbrel/umbrel-guardian/reinstall-services.sh
 
@@ -857,35 +814,24 @@ git pull && \
 sudo bash reinstall-services.sh
 ```
 
-Two details in that command are deliberate:
+This pulls the latest code and re-deploys the systemd units. Your `config.env` is
+not tracked by git and won't be overwritten.
 
-- **`git pull`, not `sudo git pull`.** The checkout belongs to `umbrel`. Pulling
-  as root leaves root-owned objects inside `.git/`, and the next ordinary pull
-  fails on them.
-- **Chained with `&&`.** Pasted as separate lines, a *failed* pull is followed by
-  a reinstall that redeploys the code you already had — which looks exactly like
-  the update not working, when in fact it never arrived.
+Two details are deliberate: `git pull` rather than `sudo git pull`, because the
+checkout belongs to `umbrel` and pulling as root leaves root-owned objects in
+`.git/`; and `&&` between the steps, so a failed pull does not go on to reinstall
+the code you already had.
 
-Pulls the latest code and re-deploys systemd services. Your `config.env` is not
-tracked by git and won't be overwritten.
-
-**If `git pull` aborts with "Your local changes to the following files would be
-overwritten by merge"**, check what actually differs before discarding anything:
+**If `git pull` aborts with "Your local changes … would be overwritten"**, see
+what actually differs before discarding anything:
 
 ```bash
 git diff <the file it named>
 ```
 
-A diff showing only `old mode 100644 / new mode 100755` is a permission bit, not
-a content change, and is safe to drop with `git checkout -- <file>`. This used to
-happen on every update: `reinstall-services.sh` runs `chmod +x` over
-`scripts/*.sh`, so any script committed non-executable came back as a modified
-file and blocked the next pull. The install directory *is* the git checkout, so
-the modes the installer sets have to match the modes git records — there is now a
-test asserting exactly that, and all 24 installed executables are committed 755.
-
-If the diff shows real content changes, you edited that file: `git stash` keeps
-the edits, `git checkout --` throws them away.
+A diff showing only `old mode 100644 / new mode 100755` is a permission bit, and
+`git checkout -- <file>` is safe. Real content changes mean you edited that file:
+`git stash` keeps the edits, `git checkout --` throws them away.
 
 ---
 
