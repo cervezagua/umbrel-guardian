@@ -367,8 +367,15 @@ if [ -w "$RW_CANARY" ]; then
     else
         rm -f "$DEST_BASE/.guardian-write-test" 2>/dev/null || true
     fi
+elif [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    # Not root at all. The canary is unwritable for every unprivileged caller,
+    # not just a sandboxed one, and blaming the sandbox here tells someone
+    # running this from a plain shell something false about where they are —
+    # which is how a tool loses the benefit of the doubt on the lines that
+    # matter. Name the actual reason and how to get past it.
+    echo "ℹ️ Writability not checked (needs root — run with sudo)"
 else
-    # Not a problem, and not silence either — say which check did not run.
+    # Root, yet the canary is unwritable: that is the sandbox.
     echo "ℹ️ Writability not checked (running inside the bot's read-only sandbox)"
 fi
 

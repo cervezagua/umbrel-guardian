@@ -98,6 +98,22 @@ def inspect(root, rel, required):
     exactly how an account disappears without anything looking wrong.
     """
     state, payload = read(os.path.join(root, rel))
+
+    # Parsing is necessary and not sufficient: every file here is a mapping, and
+    # YAML will happily read rubbish as something else.
+    #
+    # A live node lost cloudflared when 987 bytes of filesystem block pairs
+    # landed in its settings.yml during an interrupted write. The garbage began
+    # ">-", a folded block scalar, so the whole file parsed cleanly as one
+    # string and this check called it healthy while umbreld refused to start the
+    # app with "[apps-data-root-invalid-location] Invalid app data root". The
+    # app was dead for hours with every check reporting fine.
+    #
+    # None is left alone: an empty document is a file with no settings, which is
+    # legitimate. A string, number or list where a mapping belongs is not.
+    if state == "ok" and payload is not None and not isinstance(payload, dict):
+        return "corrupt", "parsed as %s, not a mapping" % type(payload).__name__
+
     if state == "ok" and required:
         absent = [key for key in required if not has(payload, key)]
         if absent:
@@ -115,8 +131,13 @@ def targets(source, mirror):
     for root in (source, mirror):
         for app_dir in glob.glob(os.path.join(root, "app-data", "*")):
             app = os.path.basename(app_dir)
-            for name in ("settings.yml", "docker-compose.yml"):
-                found.setdefault(os.path.join("app-data", app, name), None)
+            # settings.yml has no key every app must carry — some hold only
+            # "autoStart", others add "dependencies" — so the mapping check
+            # above is the whole test. docker-compose.yml always has services;
+            # one without them cannot start anything.
+            for name, required in (("settings.yml", None),
+                                   ("docker-compose.yml", ("services",))):
+                found.setdefault(os.path.join("app-data", app, name), required)
     return sorted(found.items())
 
 
