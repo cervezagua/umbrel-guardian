@@ -43,6 +43,25 @@ case "${1:-}" in
             # and a monitor that cries wolf is worse than one that says nothing:
             # stay quiet, re-stamp, and be correct from the next boot on.
             echo "boot marker carries no boot id (pre-upgrade format) — cannot judge the last shutdown"
+            # One-time migration, and it happens exactly once per node: after this
+            # the marker carries a boot id and this branch is unreachable.
+            #
+            # The version that wrote empty markers decided "unclean" from the
+            # marker's mere existence, which was true whenever the machine was
+            # running — so it stamped the verdict on every single reinstall. Any
+            # verdict sitting here alongside a legacy marker is therefore almost
+            # certainly that false alarm, and because it carries the live boot id
+            # it would re-alert every 30 minutes until the next clean shutdown.
+            #
+            # A real power loss stamps the same value, so this cannot tell them
+            # apart. Clearing risks dropping one warning about a power-off the
+            # operator already lived through; keeping it guarantees recurring
+            # noise on the one alert that exists to be believed. Clear it, and
+            # say so rather than doing it quietly.
+            if [ -e "$UNCLEAN" ]; then
+                rm -f "$UNCLEAN" 2>/dev/null || true
+                echo "cleared a shutdown verdict left by the pre-upgrade check, which flagged every reinstall"
+            fi
         elif [ "$WAS" != "$NOW" ]; then
             printf '%s\n' "$NOW" > "$UNCLEAN" 2>/dev/null || true
             echo "previous shutdown was unclean (marker from boot $WAS survived into $NOW)"

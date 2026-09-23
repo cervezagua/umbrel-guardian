@@ -441,6 +441,19 @@ systemctl enable umbrel-guardian-bot.service
 systemctl restart umbrel-guardian-bot.service  # restart so any group/code changes take effect
 systemctl enable --now umbrel-guardian-daily.timer
 systemctl enable --now umbrel-guardian-cleanshutdown.service
+# `--now` does not re-run ExecStart on a unit that is already active, and this one
+# is Type=oneshot RemainAfterExit=yes — so on a live node the marker logic above
+# would not take effect until the next reboot. Arm it directly instead.
+#
+# Deliberately NOT `systemctl restart`: that runs ExecStop first, which removes
+# the marker, and --arm would then read "no marker" as a clean previous shutdown
+# and erase a verdict legitimately reached earlier in this same boot. Calling
+# --arm on its own is idempotent and keeps a real alert intact.
+if [ -x "$INSTALL_DIR/scripts/boot-marker.sh" ]; then
+    ARM_OUT="$("$INSTALL_DIR/scripts/boot-marker.sh" --arm 2>&1 || true)"
+    [ -n "$ARM_OUT" ] && echo "  ℹ️ Shutdown marker: $ARM_OUT"
+    chown -R umbrel:umbrel "$STATE_DIR" 2>/dev/null || true
+fi
 
 if [ -n "${BACKUP_PATH:-}" ]; then
     systemctl enable --now umbrel-guardian-backup.timer
