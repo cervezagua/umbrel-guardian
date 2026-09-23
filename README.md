@@ -80,6 +80,57 @@ If a previous `config.env` exists, the installer asks before overwriting it — 
 | `/unlock <PIN>` | 🔓 Disable safe mode |
 | `/help` | ❓ Show available commands (alias: `/start`) |
 
+### Command list for BotFather
+
+Paste this into Telegram to get a tappable command menu in the chat: message
+[@BotFather](https://t.me/BotFather) → `/setcommands` → pick your bot → paste the
+whole block below in one message.
+
+```
+status - System overview: disk, RAM, CPU, uptime, app count
+apps - List installed apps with their state
+health - Run a health check now and report results
+uptime - System uptime
+disk_health - Kernel I/O errors, SMART attributes, SD/eMMC wear
+storage - Per-app storage usage
+verify_backup - Check the backup is restorable (add: deep)
+notifications - Pending umbrelOS notifications
+updates - umbrelOS version and available updates
+backup - Trigger a manual backup immediately
+restart - Restart an app: /restart <app_id> or /restart unhealthy
+logs - Container logs: /logs <app_id> [lines, default 50]
+restore - List damaged config files; /restore all puts them back
+system_reboot - Reboot the Pi (2-step confirm)
+system_shutdown - Power off the Pi (2-step confirm)
+restart_docker - Restart the Docker daemon (2-step confirm)
+restart_umbrel - Restart umbreld (2-step confirm)
+system_cancel - Cancel a pending reboot or shutdown
+lock - Enable safe mode: disable commands that change the node
+unlock - Disable safe mode: /unlock <PIN>
+help - Show available commands
+```
+
+BotFather's format is `command - description`, one per line, **no leading slash**
+— it adds that itself. Names are lowercase `a-z`, `0-9` and `_`, up to 32
+characters; descriptions up to 256.
+
+Four things are deliberately absent, and adding them makes the menu worse:
+
+- **`/restart_<app_id>`** — generated per app, so it cannot be a fixed entry.
+  `/apps` prints one as a tappable shortcut for every app it lists, which is
+  where you actually want it.
+- **`/disks`** — an alias for `/disk_health`. Listing both shows the same command
+  twice.
+- **`/system_reboot_confirm` and the three other `_confirm` verbs** — only valid
+  inside the 30-second confirmation window. In the menu they would look like
+  ordinary commands and answer `❌ No pending … to confirm.` when tapped, which
+  is precisely the confusion the two-step flow exists to avoid. The bot tells you
+  the exact verb to send when it asks.
+- **`/start`** — Telegram already offers it as a button on a new chat, and it
+  does the same thing as `/help`.
+
+To take the menu away again: `/setcommands`, pick the bot, and send a single `-`.
+
 ### System control commands
 
 `/system_reboot`, `/system_shutdown`, `/restart_docker`, `/restart_umbrel` all use a two-step confirmation flow to prevent accidental taps:
