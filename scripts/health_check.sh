@@ -67,6 +67,25 @@ fi
 #   unknown                                                  → real problem
 # We only alert on "unknown" so transient states don't flap and stopped
 # apps (which the user deliberately turned off) don't trigger alerts.
+#
+# ...with one exception, because "unknown" is also what a healthy app looks like
+# before umbreld has got to it. umbreld keeps app state in memory only and
+# initialises every app to "unknown" at startup, so for a while after a boot or
+# an OS update the list reads unknown for apps that are simply not up yet. A
+# live node upgrading 1.7.4 → 2.0.0 was told "❌ cloudflared is unknown" in the
+# same minute as the update notice, about an app that was merely still starting.
+#
+# So inside a grace window after boot, "unknown" is treated as not-yet-known
+# rather than broken. This defers the judgement, it does not suppress it: an app
+# still unknown after the window is reported on the next tick. Nothing else is
+# affected — a genuinely bad state that is not "unknown" still reports at once.
+APP_GRACE_SECONDS="${GUARDIAN_APP_GRACE_SECONDS:-900}"
+UPTIME_SECONDS=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d. -f1)
+# An unreadable /proc/uptime must not silently enable the grace window forever;
+# treat it as "long since booted" so the check keeps its teeth.
+[ -n "${UPTIME_SECONDS:-}" ] || UPTIME_SECONDS=999999
+if [ "$UPTIME_SECONDS" -lt "$APP_GRACE_SECONDS" ]; then APP_GRACE=1; else APP_GRACE=0; fi
+
 if command -v umbreld &>/dev/null; then
     # The app list reaches Python through the ENVIRONMENT, not a pipe.
     #
@@ -79,10 +98,11 @@ if command -v umbreld &>/dev/null; then
     # collapsing it into python3 -c would be a quoting minefield); only the data
     # path moves.
     APP_RAW=$(guardian_umbreld "$GUARDIAN_UMBRELD_TIMEOUT" apps.list.query 2>&1)
-    APP_ISSUES=$(APP_RAW="$APP_RAW" python3 - <<'PYEOF'
+    APP_ISSUES=$(APP_RAW="$APP_RAW" APP_GRACE="$APP_GRACE" python3 - <<'PYEOF'
 import os, json, sys
 
 raw = os.environ.get("APP_RAW", "")
+GRACE = os.environ.get("APP_GRACE") == "1"
 decoder = json.JSONDecoder()
 apps = None
 try:
@@ -104,6 +124,9 @@ INTENTIONAL = {"stopped"}
 for app in apps:
     state = app.get("state", "unknown")
     if state in HEALTHY or state in TRANSIENT or state in INTENTIONAL:
+        continue
+    # Shortly after boot this is "umbreld has not resolved it yet", not "broken".
+    if state == "unknown" and GRACE:
         continue
     print(f"❌ {app['id']} is {state}")
 PYEOF

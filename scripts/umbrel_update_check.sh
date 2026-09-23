@@ -117,16 +117,43 @@ self_check() {
         total=$((total + 1))
         if eval "$2" &>/dev/null; then ok_count=$((ok_count + 1)); else missing+=("$1"); fi
     }
+
+    # Everything below /etc and /usr is restored from the OS image on an update,
+    # so this list has to be everything reinstall-services.sh puts outside
+    # $INSTALL_DIR. Anything deployed there but missing from this list is a
+    # component the self-check will happily declare "intact" while it is gone.
     check "bot service"            "[ -f /etc/systemd/system/umbrel-guardian-bot.service ]"
     check "bot running"            "systemctl is-active --quiet umbrel-guardian-bot.service"
     check "health timer"           "systemctl is-enabled --quiet umbrel-guardian-health.timer"
-    check "backup timer"           "systemctl is-enabled --quiet umbrel-guardian-backup.timer"
-    check "backup trigger path"    "systemctl is-enabled --quiet umbrel-guardian-backup-trigger.path"
+    check "shutdown marker"        "systemctl is-enabled --quiet umbrel-guardian-cleanshutdown.service"
     check "sudoers"                "[ -f /etc/sudoers.d/umbrel-guardian-system ]"
+    # The gateway is the one that matters most on exactly the update this
+    # message fires for. It lives in /usr/local, so an OTA wipes it; and from
+    # umbrelOS 2.0 on it is how every umbreld-backed command reaches umbreld, so
+    # without it /apps, /status, /restart, /notifications and /updates all fail.
+    # It was absent from this list when a live node upgraded 1.7.4 → 2.0.0 and
+    # was told "came through the update intact".
+    check "umbreld gateway"        "[ -x /usr/local/lib/umbrel-guardian/umbreld-query.sh ]"
+    check "journald cap"           "[ -f /etc/systemd/journald.conf.d/90-umbrel-guardian.conf ]"
+    check "inotify limits"         "[ -f /etc/sysctl.d/40-inotify-umbrel.conf ]"
     check "pre-start hook"         "[ -x /home/umbrel/umbrel/custom-hooks/pre-start ]"
     check "scripts executable"     "[ -x $SCRIPT_DIR/backup.sh ]"
     check "config"                 "[ -f $CONFIG ]"
     check "state dir"              "[ -d $STATE_DIR ]"
+
+    # Conditional, because reinstall-services.sh only deploys these when there is
+    # a backup drive to deploy them for. Demanding them unconditionally reported
+    # a correctly-installed node as missing components — the same bug as the
+    # gateway above, pointing the other way.
+    if [ -n "${BACKUP_PATH:-}" ]; then
+        check "backup timer"        "systemctl is-enabled --quiet umbrel-guardian-backup.timer"
+        check "backup trigger path" "systemctl is-enabled --quiet umbrel-guardian-backup-trigger.path"
+        if [[ "${AUTO_MOUNT:-n}" =~ ^[Yy] ]]; then
+            check "mount helper"    "[ -x /usr/local/bin/mount-umbrel-backup.sh ]"
+            check "udev rule"       "[ -f /etc/udev/rules.d/99-umbrel-backup.rules ]"
+        fi
+    fi
+
     SELF_CHECK_TOTAL=$total
     SELF_CHECK_OK=$ok_count
     SELF_CHECK_MISSING="${missing[*]:-}"
