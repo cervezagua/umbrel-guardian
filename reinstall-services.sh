@@ -457,6 +457,15 @@ fi
 
 if [ -n "${BACKUP_PATH:-}" ]; then
     systemctl enable --now umbrel-guardian-backup.timer
+    # Clear a stale trigger BEFORE enabling the watcher. The .path unit uses
+    # PathExists=, which fires the instant the path is there — so a leftover
+    # trigger file means `enable --now` immediately starts an unrequested
+    # backup. That file is exactly what a node with no BACKUP_PATH accumulates:
+    # /backup used to write it with nothing watching, so the first reinstall
+    # after configuring a drive would kick off a backup nobody asked for.
+    # backup.sh removes the trigger itself on a normal run; this only catches
+    # the ones no run ever consumed.
+    rm -f "$INSTALL_DIR/.backup-trigger" 2>/dev/null || true
     systemctl enable --now umbrel-guardian-backup-trigger.path
     if [[ "${AUTO_MOUNT:-n}" =~ ^[Yy] ]]; then
         systemctl enable --now umbrel-guardian-mount-backup.service 2>/dev/null || true
