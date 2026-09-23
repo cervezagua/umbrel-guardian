@@ -80,11 +80,60 @@ fi
 # still unknown after the window is reported on the next tick. Nothing else is
 # affected — a genuinely bad state that is not "unknown" still reports at once.
 APP_GRACE_SECONDS="${GUARDIAN_APP_GRACE_SECONDS:-900}"
+# Never defer for longer than this in total. umbreld has crash-looped on this
+# hardware before ("restart counter is at 31"), and a window keyed to its start
+# time would be reset by every loop — leaving the app check silent forever
+# exactly when apps are most likely to be broken. Deferring is only ever worth
+# it if it is bounded.
+APP_GRACE_MAX="${GUARDIAN_APP_GRACE_MAX:-$(( APP_GRACE_SECONDS * 2 ))}"
+
 UPTIME_SECONDS=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d. -f1)
 # An unreadable /proc/uptime must not silently enable the grace window forever;
 # treat it as "long since booted" so the check keeps its teeth.
 [ -n "${UPTIME_SECONDS:-}" ] || UPTIME_SECONDS=999999
-if [ "$UPTIME_SECONDS" -lt "$APP_GRACE_SECONDS" ]; then APP_GRACE=1; else APP_GRACE=0; fi
+
+# What resets app state to "unknown" is umbreld starting, NOT the machine
+# booting. Keying this to uptime was wrong: a `systemctl restart umbrel` on a
+# node that had been up for hours wiped umbreld's in-memory state while uptime
+# stayed large, so the window never opened and a still-starting app was reported
+# as broken. Guardian's own /restart_umbrel command triggers exactly that.
+#
+# ActiveEnterTimestampMonotonic is microseconds since boot, on the same clock as
+# /proc/uptime, so the subtraction needs no wall-clock and survives NTP steps.
+UMBRELD_AGE="$UPTIME_SECONDS"
+SVC_MONO=$(systemctl show umbrel.service -p ActiveEnterTimestampMonotonic 2>/dev/null | cut -d= -f2)
+if [[ "${SVC_MONO:-}" =~ ^[0-9]+$ ]] && [ "$SVC_MONO" -gt 0 ]; then
+    _svc_age=$(( UPTIME_SECONDS - SVC_MONO / 1000000 ))
+    # A negative age means the two clocks disagree; rather than trust it, fall
+    # back to uptime, which is the stricter of the two.
+    [ "$_svc_age" -ge 0 ] && UMBRELD_AGE="$_svc_age"
+fi
+
+if [ "$UMBRELD_AGE" -lt "$APP_GRACE_SECONDS" ]; then APP_GRACE=1; else APP_GRACE=0; fi
+
+# Bound the total deferral, per APP_GRACE_MAX above.
+#
+# Unlike STATE_FILE (which lives in /run and is therefore always writable), this
+# is under the install directory, and nothing in this script created it —
+# reinstall-services.sh does. On a node where .state is missing, the redirection
+# below fails and the shell reports it before the command's own 2>/dev/null can
+# suppress anything, so the health timer's journal fills with "No such file or
+# directory" every run. Create it, and brace-group the write so a read-only
+# filesystem degrades quietly instead.
+GRACE_SINCE_FILE="$STATE_DIR/app-grace-since"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+if [ "$APP_GRACE" -eq 1 ]; then
+    NOW_EPOCH=$(date +%s)
+    GRACE_SINCE=$(cat "$GRACE_SINCE_FILE" 2>/dev/null || true)
+    if ! [[ "${GRACE_SINCE:-}" =~ ^[0-9]+$ ]]; then
+        GRACE_SINCE="$NOW_EPOCH"
+        { printf '%s\n' "$GRACE_SINCE" > "$GRACE_SINCE_FILE"; } 2>/dev/null || true
+    fi
+    if [ "$(( NOW_EPOCH - GRACE_SINCE ))" -ge "$APP_GRACE_MAX" ]; then APP_GRACE=0; fi
+else
+    # Out of the window: forget the start, so the next restart gets a full one.
+    rm -f "$GRACE_SINCE_FILE" 2>/dev/null || true
+fi
 
 if command -v umbreld &>/dev/null; then
     # The app list reaches Python through the ENVIRONMENT, not a pipe.
