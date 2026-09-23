@@ -15,6 +15,11 @@ Runs directly on the host — no Umbrel app store required, no modifications to 
 | 📊 **Daily Summary** | Morning status report delivered to Telegram at 09:00 |
 | 🔄 **Self-healing across reboots & OTAs** | Re-installs itself on every boot via Umbrel's pre-start hook — survives reboots and OS updates on the SD-card-boot + SSD-data layout |
 | 🔌 **Backup Drive Auto-Mount** | udev hot-plug + boot service — mount backup drive automatically |
+| 🔍 **Corruption Detection** | Parses the configs umbrelOS cannot start without, on the node *and* in the backup — a comparison cannot see corruption |
+| 🛟 **Guided Restore** | `/restore` puts a damaged config back from the backup, and refuses to restore the wrong way round |
+| 🩺 **Disk Health** | SMART, SD/eMMC wear and kernel I/O errors, latched so a failing card cannot go quiet again |
+| ⚡ **Unclean Shutdown Alerts** | Tells you when the plug was pulled — the most common cause of silently corrupted config |
+| 🔔 **umbrelOS Relay** | Forwards umbrelOS's own notifications, version and available updates to Telegram |
 | 🔐 **Access Control** | Authorized users list + safe mode with PIN lock |
 | 🛡 **Security Hardened** | Rate limiting, input validation, sandboxed systemd services |
 <img width="168" height="320" alt="telegram_ss" src="https://github.com/user-attachments/assets/8b5e26e1-40b3-4820-b062-32818f930692" />
@@ -23,7 +28,8 @@ Runs directly on the host — no Umbrel app store required, no modifications to 
 
 ## 📋 Requirements
 
-- Umbrel OS (tested on **Umbrel 1.7.2**, Raspberry Pi 5 8 GB; compatible with 1.5+)
+- umbrelOS — tested on **1.7.2**, **1.7.4** and **2.0**
+- Raspberry Pi — tested on a **Pi 5 (8 GB)** and a **Pi 4 (4 GB)**
 - A Telegram bot token (from [@BotFather](https://t.me/BotFather))
 - Your Telegram Chat ID (from [@userinfobot](https://t.me/userinfobot))
 - *(Optional)* An external USB/SATA drive for backups
@@ -140,7 +146,7 @@ To take the menu away again: `/setcommands`, pick the bot, and send a single `-`
 
 If you miss the 30-second window, the confirmation expires and you have to start over. For reboot/shutdown there's an additional **60-second grace period** after confirmation during which `/system_cancel` aborts the operation.
 
-All four commands are blocked by `/lock` (you must `/unlock <PIN>` first). The sudoers entry at `/etc/sudoers.d/umbrel-guardian-system` allows *exactly* these five subcommands of `scripts/system_control.sh`, plus the two read-only diagnostics `disk_health.sh` and `verify_backup.sh` — nothing else — and is re-deployed on every boot by `reinstall-services.sh` (because `/etc/sudoers.d/` is wiped each boot).
+All four commands are blocked by `/lock` (you must `/unlock <PIN>` first). They are reached through `/etc/sudoers.d/umbrel-guardian-system`, which lists **eighteen exact command lines and nothing else**: the five subcommands of `scripts/system_control.sh`, the read-only diagnostics in `disk_health.sh` and `verify_backup.sh`, the two `restore_file.sh` verbs, and the six umbreld procedures the gateway exposes. It is re-deployed on every boot by `reinstall-services.sh`, because `/etc/sudoers.d/` is wiped each boot.
 
 ### When an app is stuck "restarting" forever
 
@@ -280,36 +286,51 @@ umbrel-guardian/
 
 ## ⚙️ Configuration
 
-After install, edit `/home/umbrel/umbrel/umbrel-guardian/config.env`:
+**You don't normally edit `config.env` by hand — `install.sh` writes it during
+setup.** Setup asks for everything the bot needs: the Umbrel directory, your bot
+token and chat ID, an optional safe-mode PIN, the backup drive, scope and time,
+auto-mount, and how often health checks run.
 
-```env
-BOT_TOKEN=your_token_here
-
-# Single admin
-CHAT_ID=your_chat_id
-
-# Multiple admins (comma-separated) — overrides CHAT_ID for notifications
-# CHAT_IDS=123456789,987654321
-
-# Who can issue commands (defaults to CHAT_ID/CHAT_IDS if not set)
-# ALLOWED_USERS=123456789
-
-UMBREL_DIR=/home/umbrel/umbrel
-BACKUP_PATH=/mnt/root/mnt/umbrel-backup  # rugpi: /mnt/root/mnt/... — non-rugpi: /mnt/...
-BACKUP_SCOPE=essential    # essential (app-data + db + secrets) | full (entire Umbrel dir)
-BACKUP_KEEP=3             # number of essential snapshots to retain
-# BACKUP_SKIP_SPACE_CHECK=y  # run a full clone even if the drive looks too small
-BACKUP_TIME=02:00         # daily backup time (24h, UTC)
-AUTO_MOUNT=y              # auto-mount backup drive by label (udev hot-plug + boot)
-DISK_THRESHOLD=90         # alert when disk exceeds this %
-LOCK_PIN=                 # PIN for /lock / /unlock safe mode (leave blank to disable)
-```
-
-**Reload config** without restarting the bot (no downtime):
+To change one of those afterwards, edit
+`/home/umbrel/umbrel/umbrel-guardian/config.env` and reload with no downtime:
 
 ```bash
 kill -HUP $(systemctl show -p MainPID umbrel-guardian-bot | cut -d= -f2)
 ```
+
+`config.env.example` is the full reference, with a comment on every key. These
+are the ones setup never asks about, because their defaults are fine until they
+aren't:
+
+| Key | Default | What it does |
+|---|---|---|
+| `CHAT_IDS` | — | Comma-separated admins; overrides `CHAT_ID` for notifications |
+| `ALLOWED_USERS` | `CHAT_IDS`/`CHAT_ID` | Who may issue commands, if that should be a narrower set than who gets alerts |
+| `DISK_THRESHOLD` | `90` | Alert above this disk percentage |
+| `JOURNAL_MAX_SIZE` | `200M` | Cap on the systemd journal, re-applied every boot |
+| `BACKUP_EXCLUDE_CHURN` | `y` | Skip caches umbrelOS regenerates (app stores, thumbnails, file index) |
+| `BACKUP_ESSENTIAL_INCLUDE_HOME` | `n` | Include `home/` — your Files and Photos — in essential snapshots |
+| `BACKUP_SKIP_SPACE_CHECK` | `n` | Run a full clone even when the drive looks too small |
+
+`HEALTH_INTERVAL` and `INSTALL_DIR` are also in the file, but both are written by
+`install.sh` and are not meant to be edited by hand.
+
+### Who can actually use the bot
+
+**The allowlist is the access control, and it lives here — not in Telegram.**
+Anyone who knows your bot's username can send it a message; what stops them is
+that the bot ignores any chat ID not in `ALLOWED_USERS` (falling back to
+`CHAT_IDS`/`CHAT_ID`), and ignores group and channel messages outright. Keep that
+list accurate and it is the only thing that has to hold.
+
+Separately, BotFather can give the bot an app-style entry point instead of a
+plain chat: [@BotFather](https://t.me/BotFather) → `/mybots` → your bot → **Bot
+Settings** → **Configure Mini App**. The bot's profile then shows an **Open App**
+button, which is a much nicer way in from a phone. It changes how you reach the
+bot, not who is allowed to use it — the allowlist above still does that job.
+
+For the tappable command menu, see
+[Command list for BotFather](#command-list-for-botfather).
 
 ---
 
@@ -527,7 +548,7 @@ Modern Umbrel (1.7.x) on a Raspberry Pi runs on a [rugpi](https://oss.silitics.c
 
 Only two places survive:
 
-- `/home` — on the SD card partition (`mmcblk0p7` on a Pi 5).
+- `/home` — on the SD card partition (`mmcblk0p7` in umbrelOS's rugpi layout, on both the Pi 4 and Pi 5 tested here).
 - `/home/umbrel/umbrel/` — on the external data drive (the SSD), bind-mounted on top of `/home/umbrel/umbrel/` by `umbrel-external-storage.service` at boot. This is the **SD-card-for-boot + SSD-for-data** layout that Umbrel uses on Pi.
 
 Guardian's entire install directory — scripts, services, the `.venv/` with `requests` pre-installed, and the recovery hook — lives at `/home/umbrel/umbrel/umbrel-guardian/`, on the SSD. So it survives. The job at boot is just to re-stamp the `/etc` and `/usr` bits from there.
