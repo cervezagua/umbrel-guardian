@@ -801,10 +801,19 @@ sudo bash /home/umbrel/umbrel/umbrel-guardian/uninstall.sh
 ## 🔄 Update
 
 ```bash
-cd ~/umbrel/umbrel-guardian
-sudo git pull
+cd ~/umbrel/umbrel-guardian && \
+git pull && \
 sudo bash reinstall-services.sh
 ```
+
+Two details in that command are deliberate:
+
+- **`git pull`, not `sudo git pull`.** The checkout belongs to `umbrel`. Pulling
+  as root leaves root-owned objects inside `.git/`, and the next ordinary pull
+  fails on them.
+- **Chained with `&&`.** Pasted as separate lines, a *failed* pull is followed by
+  a reinstall that redeploys the code you already had — which looks exactly like
+  the update not working, when in fact it never arrived.
 
 Pulls the latest code and re-deploys systemd services. Your `config.env` is not
 tracked by git and won't be overwritten.
