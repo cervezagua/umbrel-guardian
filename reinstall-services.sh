@@ -130,6 +130,60 @@ if getent group docker &>/dev/null; then
     fi
 fi
 
+# ── Was the last shutdown clean? ─────────────────────────────────────────────
+# NOT decided here. It used to be, and it was wrong in both directions.
+#
+# The marker is created when the machine comes up and removed at orderly
+# shutdown, so it is present for the entire time the system is running — that is
+# its job. Testing `[ -e marker ]` from this script therefore reported a power
+# loss on every manual reinstall of a perfectly healthy node, and stamped it with
+# the live boot id so the health timer pushed the alert to Telegram. And in the
+# other direction, nothing ordered the marker unit against this hook, so at real
+# boot the marker could be re-created before this script ever read it, losing a
+# genuine detection.
+#
+# The verdict now belongs to the unit that owns the marker: the marker records
+# WHICH boot wrote it, and umbrel-guardian-cleanshutdown.service compares boot
+# ids in its own ExecStart. See scripts/boot-marker.sh.
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+chown -R umbrel:umbrel "$STATE_DIR" 2>/dev/null || true
+
+# ── Cap the journal ──────────────────────────────────────────────────────────
+# umbrelOS ships no journal limit, and on the node this was written for the
+# journal reached 1.8 GB on the system SD card. That is not just wasted space:
+# every kernel-log query had to read through it, which is what made disk
+# monitoring take 75 seconds a run, and it is continuous write load on exactly
+# the card whose wear we are trying to slow.
+#
+# /etc is restored from the image each boot, so the drop-in is rewritten every
+# time, same as the sudoers and sysctl files above. journald only reads it at
+# start — which already happened, long before this hook — so the live journal
+# is vacuumed here too, and the drop-in makes it stick from the next boot on.
+JOURNALD_CONF=/etc/systemd/journald.conf.d/90-umbrel-guardian.conf
+JOURNAL_MAX="${JOURNAL_MAX_SIZE:-200M}"
+if [[ "$JOURNAL_MAX" =~ ^[0-9]+[KMG]?$ ]]; then
+    mkdir -p /etc/systemd/journald.conf.d 2>/dev/null || true
+    cat > "$JOURNALD_CONF" <<JOURNAL_EOF
+[Journal]
+SystemMaxUse=$JOURNAL_MAX
+JOURNAL_EOF
+    # Only vacuum when actually over the cap. Vacuuming is slow on a large
+    # journal and this hook shares a 5-minute budget with everything else, so
+    # it is bounded and its failure is never fatal.
+    # `[0-9.]+` matches a lone "." and journald's sentence ends with one, so
+    # with `tail -1` this reported the size as "." — "Journal capped at 200M
+    # (was .)" on a live node. Require a leading digit and take the FIRST match:
+    # "Archived and active journals take up 1.8G in the file system."
+    JOURNAL_NOW=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?[KMGTPE]?B?' | head -1 || true)
+    if timeout 120 journalctl --vacuum-size="$JOURNAL_MAX" &>/dev/null; then
+        echo "  ✅ Journal capped at $JOURNAL_MAX (was ${JOURNAL_NOW:-unknown})"
+    else
+        echo "  ⚠️ Journal vacuum did not finish; cap applies from next boot"
+    fi
+else
+    echo "  ⚠️ JOURNAL_MAX_SIZE='$JOURNAL_MAX' is not a valid size — skipping journal cap"
+fi
+
 # ── Bump inotify watch limits (system-wide) ──────────────────────────────────
 # Umbrel 1.7.x consumes more inotify watches than 1.5; default limits cause
 # .path units (including umbrel-guardian-backup-trigger.path AND systemd's own
@@ -264,6 +318,19 @@ umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/disk_hea
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/disk_health.sh --issues
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_backup.sh
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_backup.sh --deep
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_backup.sh --integrity
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/restore_file.sh --list
+umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/restore_file.sh --all
+
+# The umbreld gateway. Five read-only queries that take no arguments, and one
+# mutation whose only wildcard is the app id — which the gateway itself
+# validates against umbrelOS's id format before it reaches umbreld.
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh apps.list.query
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh notifications.get.query
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh system.version.query
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh system.checkUpdate.query
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh system.getReleaseChannel.query
+umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh apps.restart.mutate --appId *
 SUDOERS_EOF
 # Validate with visudo before installing — a broken sudoers file breaks all sudo.
 if visudo -c -f "$TMP_SUDOERS" &>/dev/null; then
@@ -275,12 +342,33 @@ else
 fi
 rm -f "$TMP_SUDOERS"
 
+# ── Root-owned gateway to umbreld ────────────────────────────────────────────
+# umbrelOS 2.0 made `umbreld client` root-only. Guardian's scripts run as
+# `umbrel`, so without this every umbreld-backed command breaks on 2.0.
+#
+# It is deployed HERE, outside $INSTALL_DIR, on purpose. A sudo-granted script
+# that its own caller can rewrite is not a privilege boundary — and everything
+# under /home/umbrel is writable by `umbrel`. Root-owned and mode 0755, with no
+# config, libraries or state beside it to subvert either.
+PRIV_DIR=/usr/local/lib/umbrel-guardian
+mkdir -p "$PRIV_DIR"
+if [ -f "$INSTALL_DIR/scripts/umbreld-query.sh" ]; then
+    install -o root -g root -m 0755 "$INSTALL_DIR/scripts/umbreld-query.sh" \
+        "$PRIV_DIR/umbreld-query.sh"
+    echo "  ✅ Deployed umbreld gateway → $PRIV_DIR/umbreld-query.sh"
+else
+    echo "  ⚠️ scripts/umbreld-query.sh missing — umbreld commands will not work on umbrelOS 2.0"
+fi
+
 # Clean up the LEGACY sudoers file from a prior design (different filename)
 rm -f /etc/sudoers.d/umbrel-guardian 2>/dev/null || true
 
 # Manual backup trigger — the bot touches .backup-trigger, this .path unit
 # watches for it and starts umbrel-guardian-backup.service.  No sudo needed.
 cp "$INSTALL_DIR/services/umbrel-guardian-backup-trigger.path" "$SYSTEMD_DIR/"
+
+# Clean-shutdown marker. Its whole job is ExecStop; see the unit for why.
+cp "$INSTALL_DIR/services/umbrel-guardian-cleanshutdown.service" "$SYSTEMD_DIR/"
 
 # ── Deploy OTA-recovery hook (SSD-overlay path) ─────────────────────────────
 # Umbrel 1.7.x's wrapper at /opt/umbrel-custom-hooks/run-pre-start looks for
@@ -352,6 +440,20 @@ systemctl enable --now umbrel-guardian-health.timer
 systemctl enable umbrel-guardian-bot.service
 systemctl restart umbrel-guardian-bot.service  # restart so any group/code changes take effect
 systemctl enable --now umbrel-guardian-daily.timer
+systemctl enable --now umbrel-guardian-cleanshutdown.service
+# `--now` does not re-run ExecStart on a unit that is already active, and this one
+# is Type=oneshot RemainAfterExit=yes — so on a live node the marker logic above
+# would not take effect until the next reboot. Arm it directly instead.
+#
+# Deliberately NOT `systemctl restart`: that runs ExecStop first, which removes
+# the marker, and --arm would then read "no marker" as a clean previous shutdown
+# and erase a verdict legitimately reached earlier in this same boot. Calling
+# --arm on its own is idempotent and keeps a real alert intact.
+if [ -x "$INSTALL_DIR/scripts/boot-marker.sh" ]; then
+    ARM_OUT="$("$INSTALL_DIR/scripts/boot-marker.sh" --arm 2>&1 || true)"
+    [ -n "$ARM_OUT" ] && echo "  ℹ️ Shutdown marker: $ARM_OUT"
+    chown -R umbrel:umbrel "$STATE_DIR" 2>/dev/null || true
+fi
 
 if [ -n "${BACKUP_PATH:-}" ]; then
     systemctl enable --now umbrel-guardian-backup.timer

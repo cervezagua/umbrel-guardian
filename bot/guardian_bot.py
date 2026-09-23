@@ -457,7 +457,7 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
         send_message(token, chat_id, HELP_TEXT, parse_mode="MarkdownV2")
 
     elif lower == "/status":
-        out = run_script("system_status.sh", timeout=90)
+        out = run_script("system_status.sh", timeout=150)
         send_message(token, chat_id, out)
 
     elif lower == "/uptime":
@@ -487,7 +487,7 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
             send_message(token, chat_id, out)
 
     elif lower == "/apps":
-        out = run_script("apps_status.sh", timeout=90)
+        out = run_script("apps_status.sh", timeout=150)
         send_message(token, chat_id, out)
 
     elif lower.startswith("/restart"):
@@ -543,6 +543,35 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
         except OSError as e:
             send_message(token, chat_id, f"❌ Could not trigger backup: {e}")
 
+    elif lower.startswith("/restore"):
+        # Deliberately NOT in SAFE_COMMANDS: everything else the bot can do
+        # over Telegram is read-only, and this one writes to the data
+        # directory. /lock exists precisely to fence off the commands that can
+        # change the node.
+        if _locked:
+            send_message(token, chat_id,
+                         "🔒 Safe mode: /restore writes to your data directory. "
+                         "Use /unlock <PIN> first.")
+            return
+        # Only two fixed verbs, so the sudoers grant stays two exact command
+        # lines with no wildcard. A wildcard would let any argument reach a
+        # root-run script, and per-file selection is not worth that: from a
+        # phone the useful action is "fix what is broken", and anyone who wants
+        # one specific file is already at a shell.
+        parts = lower.split()
+        if len(parts) == 1:
+            send_message(token, chat_id,
+                         run_privileged_script("restore_file.sh", "--list", timeout=120))
+        elif len(parts) == 2 and parts[1] in ("all", "--all"):
+            send_message(token, chat_id,
+                         run_privileged_script("restore_file.sh", "--all", timeout=240))
+        else:
+            send_message(token, chat_id,
+                         "Usage:\n/restore — list what can be restored\n"
+                         "/restore all — restore all of it\n\n"
+                         "To restore one specific file, over SSH:\n"
+                         "sudo ~/umbrel/umbrel-guardian/scripts/restore_file.sh <path>")
+
     elif lower in ("/disk_health", "/disks"):
         # 120s: SMART probes on a sick drive are exactly the slow case, and the
         # script bounds each sub-probe itself.
@@ -561,10 +590,10 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
             send_message(token, chat_id, run_privileged_script("verify_backup.sh"))
 
     elif lower == "/notifications":
-        send_message(token, chat_id, run_script("umbrel_notifications.sh", "--list", timeout=90))
+        send_message(token, chat_id, run_script("umbrel_notifications.sh", "--list", timeout=150))
 
     elif lower == "/updates":
-        send_message(token, chat_id, run_script("umbrel_update_check.sh", "--report", timeout=90))
+        send_message(token, chat_id, run_script("umbrel_update_check.sh", "--report", timeout=150))
 
     elif lower == "/storage":
         # Was already written and working, just never wired to anything.

@@ -26,6 +26,13 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+if [ ! -r "$SCRIPT_DIR/lib-umbreld.sh" ]; then
+    echo "⚠️ scripts/lib-umbreld.sh is missing — this is a partial install." >&2
+    echo "   Re-run: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/lib-umbreld.sh"
 CONFIG="$(dirname "$SCRIPT_DIR")/config.env"
 SEND="$SCRIPT_DIR/telegram_send.sh"
 STATE_DIR="$(dirname "$SCRIPT_DIR")/.state"
@@ -39,21 +46,20 @@ MODE="send"
 
 # Overridable so the test harness can drive this without a live umbreld.
 UMBRELD_BIN="${UMBRELD_BIN:-umbreld}"
-# 45s, not the 10s that looks generous for a local query. `umbreld client` is
-# Node and burns ~2.7s of CPU to answer; the bot's unit sets CPUQuota=20%, and
-# cgroup limits apply to every process the bot spawns. Measured on a live node:
-# 1.8s unconstrained, 19.25s under that quota — a 10x multiplier. A 10s timeout
-# is therefore guaranteed to fail from the bot while passing every test run from
-# a shell, which is exactly how this shipped.
-UMBRELD_TIMEOUT=45
+# Not the 10s that looks generous for a local query. `umbreld client` is Node,
+# and on umbrelOS 2.0 a single query costs ~19s even unconstrained. A 10s
+# timeout is therefore guaranteed to fail on 2.0 while passing every test run
+# against 1.7.4, which is exactly how this shipped. The number itself lives in
+# scripts/lib-umbreld.sh, with the measurements behind it.
+UMBRELD_TIMEOUT="$GUARDIAN_UMBRELD_TIMEOUT"
 MAX_MESSAGES=5
 
-command -v "$UMBRELD_BIN" &>/dev/null || {
+guardian_umbreld_available || {
     [ "$MODE" = "list" ] && echo "ℹ️ umbreld not found — notification relay unavailable."
     exit 0
 }
 
-RAW=$(timeout "$UMBRELD_TIMEOUT" "$UMBRELD_BIN" client notifications.get.query 2>&1)
+RAW=$(guardian_umbreld "$UMBRELD_TIMEOUT" notifications.get.query 2>&1)
 RC=$?
 
 # umbrelOS 1.7.x may not have the notifications module at all, and an upgrade

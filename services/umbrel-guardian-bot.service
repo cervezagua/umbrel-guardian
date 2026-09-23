@@ -19,15 +19,47 @@ StandardError=journal
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=/home/umbrel/umbrel/umbrel-guardian
-MemoryMax=128M
-# CPUQuota applies to the whole cgroup — the bot AND every process it spawns.
-# `umbreld client` is Node and burns ~2.7s of CPU per query, so under this quota
-# it takes ~19s wall instead of ~1.8s. Measured on a live node. Any timeout on an
-# umbreld call from the bot has to budget for that multiplier; scripts use 45s
-# and the bot allows 90s for the commands that make such a call. The limit stays
-# because a runaway bot must not be able to starve a Bitcoin node — the answer is
-# realistic timeouts, not a weaker sandbox.
-CPUQuota=20%
+# --- Resource limits, sized for the weakest hardware this has to run on ------
+# Reference node: Raspberry Pi 4, 4 GB RAM, four cores, running Bitcoin +
+# Electrs + Monero — about 2.5 GB resident before Guardian starts. Every number
+# below is chosen so Guardian cannot be the reason that node falls over.
+#
+# CPU. These are two different tools and this unit needs both:
+#
+#   CPUQuota  a ceiling, enforced whether or not anyone else wants the CPU.
+#             On a four-core Pi, 100% means one core — a quarter of the
+#             machine — not "unlimited".
+#   CPUWeight a share, and it only bites when the cores are actually contended.
+#             Under load the bot yields; on an idle machine it runs full speed.
+#
+# CPUQuota=20% was a ceiling with no floor under it: it held the bot to a fifth
+# of a core even when the machine was completely idle. On umbrelOS 2.0 that
+# turned a 19.2 s umbreld query into 110 s and every umbreld-backed Telegram
+# command timed out, while the same command from a shell worked fine. Measured
+# on the reference node.
+#
+# CPUWeight is the primitive that was wanted all along — "get out of Bitcoin's
+# way" — and unlike a quota it costs nothing when Bitcoin is not asking. 20
+# against the default 100 means that under full contention the bot gets about a
+# fifth of the CPU share a default-weight neighbour gets. `umbreld client` is
+# single-threaded, so the 100% ceiling is not a real constraint on it; it is
+# there to bound a runaway bot, which is all a ceiling was ever good for.
+CPUQuota=100%
+CPUWeight=20
+#
+# Memory. MemoryHigh throttles and reclaims. MemoryMax kills. Setting only the
+# hard limit meant a transient spike was answered with SIGKILL — and this cgroup
+# holds the Python bot AND the Node process `umbreld client` spawns underneath
+# it, which together brush 128 M on 2.0. So: reclaim first, kill only for a
+# genuine leak. The everyday footprint goes down, not up; 192 M is the
+# emergency ceiling and 4.7% of the reference node's RAM.
+MemoryHigh=96M
+MemoryMax=192M
+# If the kernel does OOM-kill something in this cgroup, lose that process, not
+# the unit. The default, OOMPolicy=stop, would take the bot down because one
+# child query overran — switching the monitoring off at the exact moment memory
+# is tight, which is when it is most worth having.
+OOMPolicy=continue
 # NOTE: NoNewPrivileges is intentionally NOT set — the bot uses `sudo -n` to
 # invoke scripts/system_control.sh for /system_reboot, /system_shutdown,
 # /restart_docker, /restart_umbrel. Sudo needs setuid to escalate to root,

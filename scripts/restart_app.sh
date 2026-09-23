@@ -4,15 +4,26 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+if [ ! -r "$SCRIPT_DIR/lib-umbreld.sh" ]; then
+    echo "⚠️ scripts/lib-umbreld.sh is missing — this is a partial install." >&2
+    echo "   Re-run: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/lib-umbreld.sh"
+
 APP="${1:-}"
 
 # 120s, not 60. A restart is a stop plus a start of every container an app
-# owns, and `umbreld client` itself costs ~19s from inside the bot's CPUQuota
-# before the work even begins (measured: 1.8s unconstrained, 19.25s throttled).
+# owns, and on umbrelOS 2.0 `umbreld client` costs ~19s just to be reached,
+# before the work even begins (see scripts/lib-umbreld.sh).
 # 60s was plausibly the whole reason /restart_plex "failed" on a node where the
-# app was simply slow to come back. The bot's budget for this script is set
-# above 45 + RESTART_TIMEOUT so the script always gets to say what happened
-# rather than being killed mid-sentence.
+# app was simply slow to come back. This script makes two umbreld calls, so its
+# worst case is GUARDIAN_UMBRELD_TIMEOUT + RESTART_TIMEOUT = 90 + 120 = 210s.
+# The bot budgets 240s for it, so the script always gets to say what happened
+# rather than being killed mid-sentence. Raising either constant means checking
+# that sum against the bot's timeout again.
 RESTART_TIMEOUT=120
 
 if [ -z "$APP" ]; then
@@ -33,7 +44,7 @@ fi
 #      its dash-substituted form), use it. Lets `/restart adguard` → adguard-home.
 #   4. If multiple prefix matches, report them all so the user can be specific.
 # Capture all output (stdout + stderr) — umbreld may write JSON to either.
-RAW=$(timeout 45 umbreld client apps.list.query 2>&1) || true
+RAW=$(guardian_umbreld "$GUARDIAN_UMBRELD_TIMEOUT" apps.list.query 2>&1) || true
 RESPONSE=$(echo "$RAW" | python3 -c "
 import sys, json
 
@@ -97,7 +108,7 @@ esac
 # and the message then blamed the app id — which the block above had JUST
 # resolved against the installed list. Being told to check something already
 # verified sends you looking in the one place the fault cannot be.
-RESTART_OUT=$(timeout "$RESTART_TIMEOUT" umbreld client apps.restart.mutate --appId "$APP" 2>&1)
+RESTART_OUT=$(guardian_umbreld "$RESTART_TIMEOUT" apps.restart.mutate --appId "$APP" 2>&1)
 RESTART_RC=$?
 
 if [ "$RESTART_RC" -eq 0 ]; then

@@ -13,6 +13,10 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+if [ -r "$SCRIPT_DIR/lib-umbreld.sh" ]; then
+    source "$SCRIPT_DIR/lib-umbreld.sh"
+fi
 CONFIG="$(dirname "$SCRIPT_DIR")/config.env"
 SEND="$SCRIPT_DIR/telegram_send.sh"
 
@@ -20,6 +24,9 @@ source "$CONFIG"
 
 THRESHOLD="${DISK_THRESHOLD:-90}"
 STATE_FILE="/run/umbrel-guardian-health.last"
+# Persistent state, unlike STATE_FILE above: /run is tmpfs and resets on every
+# boot, which is exactly wrong for anything describing the previous one.
+STATE_DIR="$(dirname "$SCRIPT_DIR")/.state"
 HOST="$(hostname)"
 
 FORCE=0
@@ -71,9 +78,9 @@ if command -v umbreld &>/dev/null; then
     # The heredoc stays (this script needs both quote styles internally, so
     # collapsing it into python3 -c would be a quoting minefield); only the data
     # path moves.
-    APP_RAW=$(timeout 45 umbreld client apps.list.query 2>&1)
+    APP_RAW=$(guardian_umbreld "$GUARDIAN_UMBRELD_TIMEOUT" apps.list.query 2>&1)
     APP_ISSUES=$(APP_RAW="$APP_RAW" python3 - <<'PYEOF'
-import os, json
+import os, json, sys
 
 raw = os.environ.get("APP_RAW", "")
 decoder = json.JSONDecoder()
@@ -123,6 +130,42 @@ if [ -x "$DISK_HEALTH" ]; then
     while IFS= read -r line; do
         [ -n "$line" ] && ISSUES+=("$line")
     done <<< "${DISK_ISSUES:-}"
+fi
+
+# ── Unclean shutdown ─────────────────────────────────────────────────────────
+# Written by the pre-start hook when the previous boot's shutdown marker was
+# still present, meaning the machine lost power rather than shutting down.
+#
+# Worth interrupting someone for, because it is the most likely cause of the
+# config corruption the integrity check below hunts for, it leaves no kernel
+# error behind, and unlike failing hardware it is completely preventable. The
+# file carries the boot id it was recorded for, so the warning describes the
+# boot you are actually in and goes quiet after the next clean shutdown rather
+# than accusing you indefinitely.
+UNCLEAN_FILE="$STATE_DIR/unclean-shutdown"
+if [ -f "$UNCLEAN_FILE" ]; then
+    RECORDED_BOOT=$(head -n1 "$UNCLEAN_FILE" 2>/dev/null || true)
+    CURRENT_BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+    if [ -n "${RECORDED_BOOT:-}" ] && [ "$RECORDED_BOOT" = "$CURRENT_BOOT" ]; then
+        ISSUES+=("⚠️ The last shutdown was unclean (power loss or held button). This is the most common cause of corrupted config files — always use 'sudo shutdown -h now' or the dashboard.")
+    fi
+fi
+
+# ── Backup integrity ─────────────────────────────────────────────────────────
+# Corruption is silent. It produces no kernel error, no failed backup and no
+# failed comparison — the disk writes garbage, rsync copies the garbage, and
+# every check that only compares the two reports agreement. Nothing above this
+# line would notice, which is why a node ran for days with five destroyed files
+# in both its data directory and its backup while every check said fine.
+#
+# Same contract as disk_health.sh: deterministic lines, so identical findings
+# produce an identical fingerprint and alert exactly once.
+VERIFY_BACKUP="$SCRIPT_DIR/verify_backup.sh"
+if [ -x "$VERIFY_BACKUP" ]; then
+    INTEGRITY_ISSUES=$(sudo -n "$VERIFY_BACKUP" --integrity 2>/dev/null || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] && ISSUES+=("$line")
+    done <<< "${INTEGRITY_ISSUES:-}"
 fi
 
 # ── Deduplication ────────────────────────────────────────────────────────────

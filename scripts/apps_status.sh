@@ -9,6 +9,13 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+if [ ! -r "$SCRIPT_DIR/lib-umbreld.sh" ]; then
+    echo "⚠️ scripts/lib-umbreld.sh is missing — this is a partial install." >&2
+    echo "   Re-run: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/lib-umbreld.sh"
 CONFIG="$(dirname "$SCRIPT_DIR")/config.env"
 source "$CONFIG"
 
@@ -32,8 +39,23 @@ ALL=$(docker ps -a --format '{{.Names}} {{.State}}' 2>/dev/null)
 # "stopped", "starting", etc.). Falls back to filesystem-only enumeration
 # if umbreld is unreachable.
 APP_STATES=""
+APP_QUERY_OK=0
+APP_QUERY_ERR=""
 if command -v umbreld &>/dev/null; then
-    APP_STATES=$(timeout 45 umbreld client apps.list.query 2>&1 | python3 -c "
+    # Capture the exit status before the pipe swallows it. Piping straight into
+    # python discarded it, so a timed-out query was indistinguishable from an
+    # empty one — which is how a node with apps on it was told "No apps
+    # installed." while umbreld was simply taking too long to answer.
+    APP_RAW=$(guardian_umbreld "$GUARDIAN_UMBRELD_TIMEOUT" apps.list.query 2>&1)
+    APP_QUERY_RC=$?
+    if [ "$APP_QUERY_RC" -eq 0 ]; then
+        APP_QUERY_OK=1
+    elif [ "$APP_QUERY_RC" -eq 124 ]; then
+        APP_QUERY_ERR="umbreld did not answer within ${GUARDIAN_UMBRELD_TIMEOUT}s"
+    else
+        APP_QUERY_ERR="umbreld returned an error (exit $APP_QUERY_RC)"
+    fi
+    APP_STATES=$(printf '%s' "${APP_RAW:-}" | python3 -c "
 import sys, json
 raw = sys.stdin.read()
 decoder = json.JSONDecoder()
@@ -62,6 +84,11 @@ done <<< "$APP_STATES"
 
 echo "📦 Installed Apps"
 echo "━━━━━━━━━━━━━━━━━━"
+if [ "$APP_QUERY_OK" -eq 0 ]; then
+    echo "⚠️ Could not read the app list from umbreld — $APP_QUERY_ERR."
+    echo "   Listing what is on disk instead; states below are from Docker only."
+    echo ""
+fi
 
 # Use umbreld's app list as the authoritative source — uninstalled apps may
 # leave data directories behind in app-data/, and we don't want to show those.
@@ -132,5 +159,12 @@ for app_id in "${APP_IDS[@]}"; do
 done
 
 if [ "$FOUND" -eq 0 ]; then
-    echo "No apps installed."
+    # Only a successful query can justify this sentence. Saying it after a
+    # failure states as fact the one thing that was never established.
+    if [ "$APP_QUERY_OK" -eq 1 ]; then
+        echo "No apps installed."
+    else
+        echo "❌ No app list available: umbreld could not be reached and $APP_DATA is empty."
+        echo "   This is not the same as having no apps — nothing here could confirm either way."
+    fi
 fi

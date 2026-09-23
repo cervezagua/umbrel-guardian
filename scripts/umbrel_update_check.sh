@@ -23,6 +23,13 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+if [ ! -r "$SCRIPT_DIR/lib-umbreld.sh" ]; then
+    echo "⚠️ scripts/lib-umbreld.sh is missing — this is a partial install." >&2
+    echo "   Re-run: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/lib-umbreld.sh"
 INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
 CONFIG="$INSTALL_DIR/config.env"
 SEND="$SCRIPT_DIR/telegram_send.sh"
@@ -38,13 +45,12 @@ MODE="check"
 [ "${1:-}" = "--report" ] && MODE="report"
 
 UMBRELD_BIN="${UMBRELD_BIN:-umbreld}"
-# 45s, not the 10s that looks generous for a local query. `umbreld client` is
-# Node and burns ~2.7s of CPU to answer; the bot's unit sets CPUQuota=20%, and
-# cgroup limits apply to every process the bot spawns. Measured on a live node:
-# 1.8s unconstrained, 19.25s under that quota — a 10x multiplier. A 10s timeout
-# is therefore guaranteed to fail from the bot while passing every test run from
-# a shell, which is exactly how this shipped.
-UMBRELD_TIMEOUT=45
+# Not the 10s that looks generous for a local query. `umbreld client` is Node,
+# and on umbrelOS 2.0 a single query costs ~19s even unconstrained. A 10s
+# timeout is therefore guaranteed to fail on 2.0 while passing every test run
+# against 1.7.4, which is exactly how this shipped. The number itself lives in
+# scripts/lib-umbreld.sh, with the measurements behind it.
+UMBRELD_TIMEOUT="$GUARDIAN_UMBRELD_TIMEOUT"
 # How long between network update checks. Six hours is far more often than
 # umbrelOS ships, and keeps the timer from making an outbound call every 30
 # minutes for an answer that changes a few times a year.
@@ -59,7 +65,7 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 umbreld_json() {
     local query="$1"; shift
     local raw
-    raw=$(timeout "$UMBRELD_TIMEOUT" "$UMBRELD_BIN" client "$query" 2>/dev/null) || return 1
+    raw=$(guardian_umbreld "$UMBRELD_TIMEOUT" "$query" 2>/dev/null) || return 1
     [ -n "${raw:-}" ] || return 1
     printf '%s' "$raw" | python3 -c '
 import sys, json
@@ -87,7 +93,7 @@ elif data is not None and not isinstance(data, (dict, list)):
 ' "$@" 2>/dev/null
 }
 
-command -v "$UMBRELD_BIN" &>/dev/null || {
+guardian_umbreld_available || {
     [ "$MODE" = "report" ] && echo "ℹ️ umbreld not found — update checks unavailable."
     exit 0
 }

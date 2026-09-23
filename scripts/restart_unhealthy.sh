@@ -10,6 +10,15 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+if [ ! -r "$SCRIPT_DIR/lib-umbreld.sh" ]; then
+    echo "⚠️ scripts/lib-umbreld.sh is missing — this is a partial install." >&2
+    echo "   Re-run: sudo bash $(dirname "$SCRIPT_DIR")/reinstall-services.sh" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/lib-umbreld.sh"
+
 # Per-app and overall budgets. The loop below used to be unbounded at 60s per
 # app while the bot allowed the whole script 120s — so restarting two apps made
 # the bot report a failure while the restarts were in fact proceeding. A script
@@ -26,7 +35,7 @@ if ! command -v umbreld &>/dev/null; then
 fi
 
 # Capture all output (stdout + stderr) — umbreld may write JSON to either.
-RAW=$(timeout 45 umbreld client apps.list.query 2>&1) || true
+RAW=$(guardian_umbreld "$GUARDIAN_UMBRELD_TIMEOUT" apps.list.query 2>&1) || true
 
 UNHEALTHY=$(echo "$RAW" | python3 -c "
 import sys, json
@@ -92,7 +101,7 @@ while IFS= read -r APP_ID; do
         STOPPED_EARLY="$STOPPED_EARLY $APP_ID"
         continue
     fi
-    OUT=$(timeout "$RESTART_TIMEOUT" umbreld client apps.restart.mutate --appId "$APP_ID" 2>&1)
+    OUT=$(guardian_umbreld "$RESTART_TIMEOUT" apps.restart.mutate --appId "$APP_ID" 2>&1)
     RC=$?
     if [ "$RC" -eq 0 ]; then
         echo "✅ Restarted: $APP_ID"
