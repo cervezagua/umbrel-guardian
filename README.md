@@ -89,7 +89,9 @@ If a previous `config.env` exists, the installer asks before overwriting it — 
 
 Paste this into Telegram to get a tappable command menu in the chat: message
 [@BotFather](https://t.me/BotFather) → `/setcommands` → pick your bot → paste the
-whole block below in one message.
+whole block below in one message. Or do it in BotFather's Mini App — tap
+@BotFather's profile → **Open App** → your bot → its commands — which is the
+same thing without the slash commands.
 
 ```
 status - System overview: disk, RAM, CPU, uptime, app count
@@ -323,11 +325,16 @@ that the bot ignores any chat ID not in `ALLOWED_USERS` (falling back to
 `CHAT_IDS`/`CHAT_ID`), and ignores group and channel messages outright. Keep that
 list accurate and it is the only thing that has to hold.
 
-Separately, BotFather can give the bot an app-style entry point instead of a
-plain chat: [@BotFather](https://t.me/BotFather) → `/mybots` → your bot → **Bot
-Settings** → **Configure Mini App**. The bot's profile then shows an **Open App**
-button, which is a much nicer way in from a phone. It changes how you reach the
-bot, not who is allowed to use it — the allowlist above still does that job.
+Telegram's own controls live in BotFather's Mini App, which is a good deal
+easier than remembering its slash commands: open
+[@BotFather](https://t.me/BotFather), tap its **profile**, then **Open App**.
+That is a GUI for the same settings the chat commands expose — the command menu
+below, who may add the bot to groups, and the rest — for your bot, without
+typing `/setcommands` or `/mybots`.
+
+Worth knowing where the line falls: those settings govern how your bot behaves
+on Telegram's side, but none of them decide who may send it commands. That is
+the allowlist above, enforced by Guardian itself.
 
 For the tappable command menu, see
 [Command list for BotFather](#command-list-for-botfather).
