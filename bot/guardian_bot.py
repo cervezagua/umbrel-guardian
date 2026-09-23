@@ -529,10 +529,44 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
         send_message(token, chat_id, f"📋 Logs for {app_id} (last {lines} lines):\n{out}")
 
     elif lower == "/backup":
-        send_message(token, chat_id, "⏳ Starting backup, this may take a while...")
-        # Touch a trigger file — a systemd .path unit watches for it and
-        # starts umbrel-guardian-backup.service (runs as root, own cgroup).
-        # No sudo needed; works inside ProtectSystem=strict sandbox.
+        # Everything here is about not saying "starting" unless a backup can
+        # actually start. This command works by touching a trigger file that a
+        # systemd .path unit watches (no sudo needed, works inside the
+        # ProtectSystem=strict sandbox) — and a file write succeeds whether or
+        # not anything is listening, so the write proves nothing on its own.
+        #
+        # On a node with no backup drive it proved exactly nothing: reinstall
+        # only enables the .path unit when BACKUP_PATH is set, so the bot wrote
+        # the file, nothing read it, and the user was left with "⏳ Starting
+        # backup" and then silence, permanently. Silence is the worst available
+        # answer — it is indistinguishable from a backup still running.
+        if not cfg.get("BACKUP_PATH", "").strip():
+            # Same wording as /verify_backup: a fresh install with no drive is a
+            # normal state, not a fault.
+            send_message(token, chat_id,
+                         "ℹ️ Backups are not configured (BACKUP_PATH is empty in config.env).\n"
+                         "   Re-run install.sh to set up a backup drive.")
+            return
+
+        # BACKUP_PATH is set, but the unit that watches the trigger still has to
+        # be running. If it is not, the write below is a no-op and the user would
+        # get the same silence, so check before promising anything.
+        watcher = "umbrel-guardian-backup-trigger.path"
+        try:
+            watching = subprocess.run(
+                ["systemctl", "is-active", "--quiet", watcher], timeout=10
+            ).returncode == 0
+        except Exception:
+            watching = False
+        if not watching:
+            send_message(token, chat_id,
+                         f"❌ Cannot start a backup: {watcher} is not running, so nothing\n"
+                         "   would pick up the request.\n"
+                         "   Fix: sudo bash ~/umbrel/umbrel-guardian/reinstall-services.sh\n"
+                         "   Meanwhile a backup still works over SSH:\n"
+                         "   sudo systemctl start umbrel-guardian-backup.service")
+            return
+
         trigger = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             ".backup-trigger",
@@ -542,6 +576,10 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
                 f.write("")
         except OSError as e:
             send_message(token, chat_id, f"❌ Could not trigger backup: {e}")
+            return
+        # Only now is "starting" true. Sending it first meant the OSError branch
+        # produced a contradictory pair of messages.
+        send_message(token, chat_id, "⏳ Starting backup, this may take a while...")
 
     elif lower.startswith("/restore"):
         # Deliberately NOT in SAFE_COMMANDS: everything else the bot can do
