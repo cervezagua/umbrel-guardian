@@ -180,6 +180,50 @@ elif [ -z "${CANDIDATES:-}" ]; then
     exit 0
 fi
 
+# ── Can anything actually be written? ────────────────────────────────────────
+# Asked BEFORE umbreld is stopped, and that ordering is the whole point.
+#
+# Invoked from the bot this script used to stop umbreld, fail every single write
+# with EROFS, report "permission denied?", and start umbreld again — a restore
+# that took the node's daemon down and restored nothing. The cause was never
+# permissions: umbrel-guardian-bot.service sets ProtectSystem=strict, which
+# mounts the entire hierarchy read-only apart from the Guardian directory, and
+# that is a mount namespace, so sudo raises the uid but changes nothing about
+# what is writable. (The bot now reaches this script through systemd-run, which
+# PID 1 spawns outside that namespace.)
+#
+# A probe costs one mktemp per directory and turns an outage into a message.
+can_write_dir() {
+    local probe
+    probe="$(mktemp "$1/.guardian-probe.XXXXXX" 2>&1)" || { INSTALL_ERR="$probe"; return 1; }
+    rm -f "$probe"
+    return 0
+}
+
+WRITABLE=0
+INSTALL_ERR=""
+while IFS= read -r REL; do
+    [ -n "$REL" ] || continue
+    _dir="$(dirname "$UMBREL_SRC/$REL")"
+    [ -d "$_dir" ] || continue
+    if can_write_dir "$_dir"; then WRITABLE=1; break; fi
+done <<< "$CANDIDATES"
+
+if [ "$WRITABLE" -eq 0 ]; then
+    echo "❌ Nothing can be written under $UMBREL_SRC — stopping before anything is touched."
+    [ -n "${INSTALL_ERR:-}" ] && echo "   The system said: ${INSTALL_ERR#mktemp: }"
+    case "${INSTALL_ERR:-}" in
+        *"Read-only file system"*)
+            echo "   That is a read-only mount, not a permissions problem. A caller inside a"
+            echo "   sandboxed systemd unit (ProtectSystem=strict) sees the filesystem this way"
+            echo "   even as root; run this from a shell, or through systemd-run, as the bot does." ;;
+        *"Permission denied"*)
+            echo "   Run it as root: sudo $0 ${TARGET:---all}" ;;
+    esac
+    echo "   umbreld was NOT stopped and nothing was changed."
+    exit 1
+fi
+
 # umbrel.yaml is rewritten by umbreld on shutdown, so restoring it under a live
 # daemon means losing the good copy again minutes later.
 NEEDS_UMBRELD_STOP=false
@@ -207,27 +251,38 @@ SRC_REAL="$(realpath -e "$UMBREL_SRC" 2>/dev/null || printf '%s' "$UMBREL_SRC")"
 # Replace a file without ever writing through a link. Returns 2 when the
 # destination, or any directory on the way to it, is a symlink or resolves
 # outside the data directory.
+# Failures here used to discard the operating system's own explanation and the
+# caller reported "permission denied?" for every one of them. "Read-only file
+# system" and "Permission denied" are different problems with different fixes,
+# and guessing the wrong one sends someone to check ownership that was never
+# wrong. The real message goes in INSTALL_ERR and the caller prints it.
 install_file() {
     local src="$1" dst="$2" dir real tmp
+    INSTALL_ERR=""
     dir="$(dirname "$dst")"
-    [ -d "$dir" ] || return 1
+    [ -d "$dir" ] || { INSTALL_ERR="$dir does not exist"; return 1; }
     [ -L "$dst" ] && return 2
     # realpath resolves every component, so a symlinked PARENT is caught too.
-    real="$(realpath -e "$dir" 2>/dev/null)" || return 1
+    real="$(realpath -e "$dir" 2>/dev/null)" || { INSTALL_ERR="cannot resolve $dir"; return 1; }
     case "$real/" in
         "$SRC_REAL"/*) ;;
         *) return 2 ;;
     esac
-    tmp="$(mktemp "$dir/.guardian-restore.XXXXXX" 2>/dev/null)" || return 1
+    tmp="$(mktemp "$dir/.guardian-restore.XXXXXX" 2>&1)" || { INSTALL_ERR="${tmp#mktemp: }"; return 1; }
     # Deliberately not --preserve=ownership: the mirror copy is the thing that
     # may have been tampered with, and it does not get to decide who owns the
     # file that replaces the original.
-    if ! cp --preserve=mode,timestamps "$src" "$tmp" 2>/dev/null; then
+    if ! INSTALL_ERR="$(cp --preserve=mode,timestamps "$src" "$tmp" 2>&1)"; then
+        INSTALL_ERR="${INSTALL_ERR#cp: }"
         rm -f "$tmp"; return 1
     fi
     chown --reference="$dir" "$tmp" 2>/dev/null || true
     # rename(2) over the destination: atomic, and it cannot traverse a link.
-    mv -T "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    if ! INSTALL_ERR="$(mv -T "$tmp" "$dst" 2>&1)"; then
+        INSTALL_ERR="${INSTALL_ERR#mv: }"
+        rm -f "$tmp"; return 1
+    fi
+    INSTALL_ERR=""
     return 0
 }
 
@@ -262,7 +317,11 @@ while IFS= read -r REL; do
         2) echo "❌ $REL: destination is a symlink or resolves outside $UMBREL_SRC — refused"
            echo "   A restore must not write through a link. Remove it and re-run."
            FAILED=$((FAILED + 1)); continue ;;
-        *) echo "❌ $REL: could not write (permission denied?) — skipped"
+        *) echo "❌ $REL: could not write — ${INSTALL_ERR:-no reason reported} — skipped"
+           case "${INSTALL_ERR:-}" in
+               *"Read-only file system"*)
+                   echo "   A read-only mount, not a permissions problem — see the probe note above." ;;
+           esac
            FAILED=$((FAILED + 1)); continue ;;
     esac
 

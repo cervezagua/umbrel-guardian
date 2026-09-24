@@ -30,20 +30,26 @@
 # not alerting at all. Recovery is deliberate: --reset, after you have actually
 # replaced the hardware.
 #
-# ── Why the journal is read incrementally ────────────────────────────────────
+# ── Why the kernel ring buffer, not journald ─────────────────────────────────
 # The obvious implementation rescans a time window on every run. Measured on the
 # live node that costs 75 SECONDS: 1.8 GB of journal pulled off an SD card at
 # roughly 25 MB/s. `journalctl --grep` does not help — measured at the same 75s,
 # because it filters what is PRINTED, not what is read — and neither does a
-# longer timeout. Doing that every 30 minutes means holding a card we already
+# longer timeout. Doing that on every check means holding a card we already
 # suspect of failing under continuous read load, forever, in order to ask
 # whether it is failing.
 #
-# So each entry is read exactly once. A journal cursor in .state/ records where
-# the last run stopped; --after-cursor seeks straight there (a binary search
-# through the entry arrays, not a scan) and returns only what is new. Per-key
+# So journald is not read at all. The source of truth is the kernel ring buffer
+# via dmesg: it lives in RAM, it costs nothing, and a dying card cannot slow it
+# down. Each line is counted exactly once — .state/disk-health.dmesg holds a
+# monotonic-clock watermark saying where the last run stopped, and per-key
 # totals accumulate in .state/disk-health.counts. The latch was always
 # monotonic, so accumulating across runs is the semantics it already wanted.
+#
+# What the ring buffer does not hold is anything from before the current boot.
+# journald is asked for that exactly once, on a short leash, and the outcome is
+# recorded either way so a node with a slow journal never pays for it twice.
+# See the kernel log probe below for the full mechanism.
 #
 # Two runs racing (the 30-minute timer and someone typing /disk_health) can
 # both read the same delta, or one can overwrite the other's totals. Both are
