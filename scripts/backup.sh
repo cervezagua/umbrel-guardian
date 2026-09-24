@@ -283,24 +283,135 @@ esac
 # ── Consistent umbrel.db snapshot ───────────────────────────────────────────
 # Runs only when rsync succeeded, and before the .incomplete marker is cleared,
 # so a mirror is never advertised as restorable with a missing or torn database.
-# sqlite3's .backup uses the online backup API: it takes the same locks the
-# database itself uses and produces a file that is consistent even though
-# umbreld is still writing.
+#
+# ── Why python3 and not the sqlite3 CLI ──────────────────────────────────────
+# Both do the identical thing. `.backup` in the CLI and Connection.backup() in
+# Python's stdlib module are the same sqlite3_backup_init/step/finish C API:
+# they take the locks the database itself uses and produce a file that is
+# consistent even though umbreld keeps writing.
+#
+# The difference is what is on the node. umbrelOS ships no sqlite3 CLI, so this
+# whole step silently degraded to a live `cp` on every full clone. Installing
+# the package would not hold either: it lands in /usr, which umbrelOS restores
+# from the OS image on update, so it would disappear again at the next OTA and
+# the warning would come back intermittently — the worst kind. python3 is
+# already a hard dependency of ten scripts here and its sqlite3 module is part
+# of the standard library.
+#
+# So python3 is the primary path, which means it is the one the tests exercise.
+# The CLI stays as a fallback for a stripped python3 built without _sqlite3.
+#
+# Note for anyone reading git history: this is not a regression from 1.7.x. The
+# block is gated on umbrel.db existing at all, and that file arrived with 2.0 —
+# before then there was nothing to snapshot and the warning was unreachable.
+snapshot_umbrel_db() {
+    local src="$1" dst="$2"
+
+    # Both tools below will happily CREATE an absent source and then copy the
+    # empty result, which passes every integrity check there is. Refuse before
+    # either of them gets the chance: a snapshot of a database that is not
+    # there is not a snapshot, it is a fabrication that looks like one.
+    if [ ! -f "$src" ] || [ ! -r "$src" ]; then
+        echo "snapshot: $src is missing or unreadable" >>"$RSYNC_LOG"
+        return 1
+    fi
+
+    if timeout 300 python3 - "$src" "$dst" 2>>"$RSYNC_LOG" <<'PYEOF'
+import sqlite3, sys
+
+src, dst = sys.argv[1], sys.argv[2]
+
+def open_source(path):
+    """Read-only if possible, read-write if not.
+
+    A read-only connection to a WAL database needs the -shm file, which exists
+    while umbreld runs but not after a clean stop. connect() is lazy and will
+    not raise on its own, so force a read to make the failure surface here
+    rather than halfway through the copy.
+
+    Both modes are URIs, and neither is 'rwc'. A bare path CREATES the database
+    when it is absent, so a deleted umbrel.db would open as an empty one, copy
+    perfectly, pass quick_check and be reported as a good snapshot. A backup
+    tool must never manufacture the thing it was asked to preserve.
+    """
+    for mode in ("ro", "rw"):
+        conn = None
+        uri = "file:%s?mode=%s" % (path, mode)
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=30)
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            return conn
+        except sqlite3.Error as error:
+            print("source open failed (%s): %s" % (mode, error),
+                  file=sys.stderr)
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+    return None
+
+source = open_source(src)
+if source is None:
+    sys.exit(1)
+
+target = None
+try:
+    target = sqlite3.connect(dst, timeout=30)
+    source.backup(target)
+    # Verify what was just written. This is the file a restore depends on and
+    # nothing else in Guardian ever checks it.
+    row = target.execute("PRAGMA quick_check").fetchone()
+    ok = bool(row) and row[0] == "ok"
+    if not ok:
+        print("snapshot failed quick_check: %r" % (row,), file=sys.stderr)
+except sqlite3.Error as error:
+    print("snapshot failed: %s" % error, file=sys.stderr)
+    ok = False
+finally:
+    for conn in (target, source):
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+sys.exit(0 if ok else 1)
+PYEOF
+    then
+        return 0
+    fi
+
+    if command -v sqlite3 &>/dev/null &&
+       timeout 300 sqlite3 "$src" ".backup '$dst'" 2>>"$RSYNC_LOG"; then
+        return 0
+    fi
+
+    return 1
+}
+
 DB_WARN=""
 if [ "$SNAPSHOT_DB" = true ] && [ "$RSYNC_EXIT" -eq 0 ]; then
-    if command -v sqlite3 &>/dev/null &&
-       sqlite3 "$UMBREL_DB" ".backup '$DEST/umbrel.db'" 2>>"$RSYNC_LOG"; then
+    # Staged beside the destination, never onto it. For a full clone $DEST is
+    # the live mirror, and a snapshot that fails halfway must not be allowed to
+    # leave the mirror holding a torn database — the previous copy is worth
+    # more than a broken newer one.
+    DB_TMP="$DEST/umbrel.db.new"
+    rm -f "$DB_TMP"
+
+    if snapshot_umbrel_db "$UMBREL_DB" "$DB_TMP" && mv -f "$DB_TMP" "$DEST/umbrel.db"; then
         # Stale -wal/-shm beside a fresh snapshot would be read on restore and
         # could roll the database back to the previous state.
         rm -f "$DEST/umbrel.db-wal" "$DEST/umbrel.db-shm" "$DEST/umbrel.db-journal"
     else
+        rm -f "$DB_TMP"
         # Better a torn copy than no database at all — without it the restore has
         # nothing to promote. Say so plainly rather than failing the whole run.
         cp -f "$UMBREL_DB" "$DEST/umbrel.db" 2>>"$RSYNC_LOG" || true
-        if command -v sqlite3 &>/dev/null; then
+        if python3 -c 'import sqlite3' 2>/dev/null || command -v sqlite3 &>/dev/null; then
             DB_WARN="⚠️ umbrel.db snapshot failed — copied live instead, may be inconsistent"
         else
-            DB_WARN="⚠️ sqlite3 not installed — umbrel.db copied live, may be inconsistent"
+            DB_WARN="⚠️ No sqlite3 available (python3 module or CLI) — umbrel.db copied live, may be inconsistent"
         fi
     fi
 fi
