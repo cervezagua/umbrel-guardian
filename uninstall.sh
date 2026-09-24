@@ -31,6 +31,18 @@ echo "Removing inotify sysctl override..."
 # would be a silent change to a machine that no longer runs Guardian.
 rm -f /etc/sysctl.d/40-inotify-umbrel.conf
 
+echo "Removing journald cap..."
+# Same reasoning: Guardian capped the journal at JOURNAL_MAX_SIZE, and a machine
+# that no longer runs Guardian should not keep a limit it never asked for.
+rm -f /etc/systemd/journald.conf.d/90-umbrel-guardian.conf
+rmdir /etc/systemd/journald.conf.d 2>/dev/null || true
+
+echo "Removing root-owned helpers..."
+# umbreld-query.sh and apply-timers.sh are deployed outside $INSTALL_DIR
+# precisely so `umbrel` cannot rewrite them, which also means `rm -rf
+# $INSTALL_DIR` below never touched them. They were surviving uninstalls.
+rm -rf /usr/local/lib/umbrel-guardian
+
 echo "Removing sudoers entries..."
 rm -f /etc/sudoers.d/umbrel-guardian
 rm -f /etc/sudoers.d/umbrel-guardian-system

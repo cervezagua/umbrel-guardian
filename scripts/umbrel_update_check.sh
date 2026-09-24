@@ -134,6 +134,10 @@ self_check() {
     # It was absent from this list when a live node upgraded 1.7.4 → 2.0.0 and
     # was told "came through the update intact".
     check "umbreld gateway"        "[ -x /usr/local/lib/umbrel-guardian/umbreld-query.sh ]"
+    # Same directory, same fate: /usr is restored from the OS image on update,
+    # so both root-owned helpers disappear together. Without this one /interval
+    # and /backup_time stop working, silently, until someone tries to use them.
+    check "timer applier"          "[ -x /usr/local/lib/umbrel-guardian/apply-timers.sh ]"
     check "journald cap"           "[ -f /etc/systemd/journald.conf.d/90-umbrel-guardian.conf ]"
     check "inotify limits"         "[ -f /etc/sysctl.d/40-inotify-umbrel.conf ]"
     check "pre-start hook"         "[ -x /home/umbrel/umbrel/custom-hooks/pre-start ]"

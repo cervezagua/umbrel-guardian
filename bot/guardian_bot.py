@@ -112,8 +112,12 @@ _locked = False
 
 # Read-only commands that stay available in safe mode. Everything here must be
 # incapable of changing the node's state.
+# /schedule only reads. The three setters that change it are deliberately absent:
+# safe mode exists to stop the bot changing anything, and quietly reducing how
+# often the node is checked is exactly the kind of change it should refuse.
 SAFE_COMMANDS = {"/status", "/help", "/start", "/lock", "/unlock", "/uptime", "/apps", "/health",
-                 "/disk_health", "/disks", "/verify_backup", "/notifications", "/updates", "/storage"}
+                 "/disk_health", "/disks", "/verify_backup", "/notifications", "/updates", "/storage",
+                 "/schedule"}
 
 # Shown by /lock. Generated rather than written out, because a hardcoded list
 # silently lies the moment SAFE_COMMANDS changes — and a wrong list in safe mode
@@ -175,6 +179,61 @@ def load_config(path):
         log.error(f"Config not found: {path}")
         sys.exit(1)
     return cfg
+
+
+def set_config_value(key, value, path=None):
+    """Change one key in config.env, leaving every other byte alone.
+
+    `path` resolves to CONFIG_PATH at call time, not as a default argument. A
+    default would snapshot the module global when this function is defined,
+    which quietly ignores the GUARDIAN_CONFIG override the module documents.
+
+    Rewrites the existing line in place if the key is there, appends it if not.
+    Never reformats, never drops a comment, never reorders — config.env is
+    hand-edited as often as it is written by this, and a settings command that
+    quietly tidies someone's file is a settings command they stop trusting.
+
+    The bot is the only writer. It can do this without any privilege at all:
+    config.env lives inside ReadWritePaths and is owned by the service user. The
+    privileged half (apply-timers.sh) deliberately only reads.
+
+    Returns (True, "") or (False, reason).
+    """
+    path = path or CONFIG_PATH
+    try:
+        with open(path) as handle:
+            lines = handle.readlines()
+    except OSError as error:
+        return False, str(error)
+
+    replaced = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        if stripped.partition("=")[0].strip() == key:
+            lines[index] = f"{key}={value}\n"
+            replaced = True
+    if not replaced:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(f"{key}={value}\n")
+
+    # Temp file in the same directory, then rename: a half-written config.env is
+    # a bot that will not start after the next reboot.
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w") as handle:
+            handle.writelines(lines)
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+        os.replace(tmp, path)
+    except OSError as error:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False, str(error)
+    return True, ""
 
 
 def parse_chat_ids(cfg):
@@ -306,6 +365,87 @@ def run_privileged_script(script_name, *args, timeout=60):
         return f"⚠️ Error running {script_name}: {e}"
 
 
+PRIV_DIR = "/usr/local/lib/umbrel-guardian"
+APPLY_TIMERS = os.path.join(PRIV_DIR, "apply-timers.sh")
+RESTORE_ALL = os.path.join(SCRIPTS_DIR, "restore_file.sh")
+SYSTEMD_RUN = "/usr/bin/systemd-run"
+
+
+def run_outside_sandbox(unit, argv, timeout=60):
+    """Run a privileged command that has to WRITE somewhere this unit cannot.
+
+    `sudo` is not enough on its own. umbrel-guardian-bot.service sets
+    ProtectSystem=strict, which mounts the entire filesystem hierarchy read-only
+    except for ReadWritePaths — and that is a mount namespace. Raising the uid
+    does not leave it, so a root child of the bot still gets EROFS writing
+    /etc/systemd/system or the umbrel data directory.
+
+    This cost real time to find: /restore all stopped umbreld, failed every copy
+    with "permission denied?", and started umbreld again, on a node whose
+    permissions were perfect.
+
+    systemd-run asks PID 1 to spawn the command instead. PID 1 is outside the
+    sandbox, so the transient unit sees the real filesystem. --pipe hands it our
+    stdio, so this stays synchronous and the caller reports a real result rather
+    than "requested". --collect reaps the unit afterwards, including a failed
+    one, so a fixed unit name can be reused.
+
+    Every argv here is a fixed literal matched exactly by /etc/sudoers.d — no
+    wildcard, so nothing a chat message says can reach the command line.
+    """
+    command = ["sudo", "-n", SYSTEMD_RUN, "--quiet", "--pipe", "--wait",
+               "--collect", f"--unit={unit}"] + list(argv)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return f"⚠️ Timed out after {timeout} seconds."
+    except Exception as error:
+        return f"⚠️ Could not start {unit}: {error}"
+
+    stderr = result.stderr or ""
+    if result.returncode != 0 and ("sudo:" in stderr or "a password is required" in stderr):
+        return ("⚠️ Could not run this as root.\n"
+                "/etc/sudoers.d/ is cleared on every boot and restamped by the "
+                "pre-start hook. If this keeps happening, run:\n"
+                "sudo bash reinstall-services.sh")
+    return (result.stdout.strip() or stderr.strip()) or "(no output)"
+
+
+def next_timer_fire(unit):
+    """When systemd will next run a timer, or why it will not.
+
+    Unprivileged: `systemctl show` reads properties over D-Bus and needs no
+    root, so this stays usable in safe mode where the setters are blocked.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", unit, "-p", "NextElapseUSecRealtime", "--value"],
+            capture_output=True, text=True, timeout=10
+        )
+    except Exception:
+        return "unknown"
+    raw = (result.stdout or "").strip()
+    if not raw.isdigit() or int(raw) == 0:
+        # 0 or empty means the timer is not loaded, not enabled, or has no
+        # future elapse — all worth saying out loud rather than printing a date
+        # that does not exist.
+        return "not scheduled"
+    return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(int(raw) // 1_000_000))
+
+
+# The five forms install.sh offers and apply-timers.sh accepts, keyed by what a
+# person would type. One table, so the chat command cannot drift from the two
+# other places that know these values.
+HEALTH_INTERVALS = {
+    "15m": "*:0/15",
+    "30m": "*:0/30",
+    "1h":  "hourly",
+    "3h":  "0/3:00",
+    "12h": "0/12:00",
+}
+HEALTH_INTERVAL_LABELS = {v: k for k, v in HEALTH_INTERVALS.items()}
+
+
 HELP_TEXT = r"""🛡 *Umbrel Guardian*
 
 *Commands:*
@@ -322,6 +462,10 @@ HELP_TEXT = r"""🛡 *Umbrel Guardian*
 /storage — Per\-app storage usage
 /notifications — Pending umbrelOS notifications
 /updates — umbrelOS version and available updates
+/schedule — Show when checks and backups run
+/interval \<15m\|30m\|1h\|3h\|12h\> — How often the health check runs
+/backup\_time \<HH:MM\> — Daily backup time \(24h\)
+/alerts \<hours\> — Repeat an unchanged alert this often \(0 \= never\)
 /system\_reboot — Reboot the Pi \(2\-step confirm\)
 /system\_shutdown — Power off the Pi \(2\-step confirm\)
 /restart\_docker — Restart Docker daemon \(2\-step confirm\)
@@ -601,14 +745,119 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
             send_message(token, chat_id,
                          run_privileged_script("restore_file.sh", "--list", timeout=120))
         elif len(parts) == 2 and parts[1] in ("all", "--all"):
+            # Through systemd-run, not plain sudo: this one WRITES into the
+            # umbrel data directory, which ProtectSystem=strict makes read-only
+            # for us regardless of uid. See run_outside_sandbox.
             send_message(token, chat_id,
-                         run_privileged_script("restore_file.sh", "--all", timeout=240))
+                         run_outside_sandbox("guardian-restore",
+                                             [RESTORE_ALL, "--all"], timeout=240))
         else:
             send_message(token, chat_id,
                          "Usage:\n/restore — list what can be restored\n"
                          "/restore all — restore all of it\n\n"
                          "To restore one specific file, over SSH:\n"
                          "sudo ~/umbrel/umbrel-guardian/scripts/restore_file.sh <path>")
+
+    elif lower == "/schedule":
+        cfg_now = load_config(CONFIG_PATH)
+        raw = cfg_now.get("HEALTH_INTERVAL", "").strip()
+        health = HEALTH_INTERVAL_LABELS.get(raw, raw or "(unset)")
+        backup = cfg_now.get("BACKUP_TIME", "").strip() or "(unset)"
+        repeat = cfg_now.get("ALERT_REPEAT_HOURS", "24").strip()
+        lines = [
+            "🗓 Schedules",
+            "━━━━━━━━━━━━━━━━━━",
+            f"  Health check: every {health}",
+        ]
+        if cfg_now.get("BACKUP_PATH", "").strip():
+            lines.append(f"  Backup: daily at {backup}")
+        else:
+            lines.append("  Backup: not configured (no BACKUP_PATH)")
+        if repeat == "0":
+            lines.append("  Repeat alerts: off — an unchanged problem is reported once")
+        else:
+            lines.append(f"  Repeat alerts: every {repeat}h while a problem persists")
+        lines += [
+            "",
+            "  /interval 15m|30m|1h|3h|12h",
+            "  /backup_time HH:MM",
+            "  /alerts <hours>  (0 = never repeat)",
+        ]
+        # Ask systemd as well as config.env, because the two can disagree — a
+        # timer edited by hand, or a config change whose apply step failed — and
+        # when they do, that is the thing worth seeing. `systemctl show` is a
+        # read over D-Bus and needs no privilege, which keeps /schedule safe to
+        # leave in SAFE_COMMANDS: it reports, it never applies.
+        lines.append("")
+        lines.append(f"  Next health check: {next_timer_fire('umbrel-guardian-health.timer')}")
+        if cfg_now.get("BACKUP_PATH", "").strip():
+            lines.append(f"  Next backup: {next_timer_fire('umbrel-guardian-backup.timer')}")
+        send_message(token, chat_id, "\n".join(lines))
+
+    elif lower.startswith("/interval"):
+        parts = text.split()
+        if len(parts) != 2 or parts[1].lower() not in HEALTH_INTERVALS:
+            send_message(token, chat_id,
+                         "Usage: /interval 15m|30m|1h|3h|12h\n"
+                         "Example: /interval 30m\n\n"
+                         "This is how often the health check RUNS. How often it repeats "
+                         "itself about a problem you already know about is /alerts.")
+            return
+        choice = parts[1].lower()
+        # config.env first: it is the durable record, and reinstall-services.sh
+        # re-applies it from there. If the systemd step fails the intent still
+        # survives the next reinstall.
+        written, why = set_config_value("HEALTH_INTERVAL", HEALTH_INTERVALS[choice])
+        if not written:
+            send_message(token, chat_id, f"⚠️ Could not write config.env: {why}")
+            return
+        out = run_outside_sandbox("guardian-apply-timers", [APPLY_TIMERS], timeout=60)
+        broadcast(token, chat_ids, f"🗓 Health check interval → {choice}\n{out}")
+
+    elif lower.startswith("/backup_time"):
+        parts = text.split()
+        if len(parts) != 2 or not re.match(r'^([01][0-9]|2[0-3]):[0-5][0-9]$', parts[1]):
+            send_message(token, chat_id,
+                         "Usage: /backup_time HH:MM  (24-hour)\n"
+                         "Example: /backup_time 03:30")
+            return
+        cfg_now = load_config(CONFIG_PATH)
+        if not cfg_now.get("BACKUP_PATH", "").strip():
+            send_message(token, chat_id,
+                         "ℹ️ Backups are not configured (BACKUP_PATH is empty in config.env), "
+                         "so there is no backup timer to reschedule.")
+            return
+        written, why = set_config_value("BACKUP_TIME", parts[1])
+        if not written:
+            send_message(token, chat_id, f"⚠️ Could not write config.env: {why}")
+            return
+        out = run_outside_sandbox("guardian-apply-timers", [APPLY_TIMERS], timeout=60)
+        broadcast(token, chat_ids, f"🗓 Daily backup time → {parts[1]}\n{out}")
+
+    elif lower.startswith("/alerts"):
+        parts = text.split()
+        if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) > 168:
+            send_message(token, chat_id,
+                         "Usage: /alerts <hours>  (0-168, 0 = never repeat)\n"
+                         "Example: /alerts 24\n\n"
+                         "A problem is reported the moment it appears or changes. "
+                         "This is how long before it is mentioned again while it stays "
+                         "exactly the same.")
+            return
+        hours = str(int(parts[1]))
+        # Nothing to apply: health_check.sh sources config.env on every run, so
+        # this takes effect at the next tick with no reload and no restart.
+        written, why = set_config_value("ALERT_REPEAT_HOURS", hours)
+        if not written:
+            send_message(token, chat_id, f"⚠️ Could not write config.env: {why}")
+            return
+        if hours == "0":
+            broadcast(token, chat_ids,
+                      "🔕 Repeat alerts off. A problem is reported when it appears or "
+                      "changes, and never repeated. /health still answers on demand.")
+        else:
+            broadcast(token, chat_ids,
+                      f"🔔 Repeat alerts → every {hours}h while a problem persists.")
 
     elif lower in ("/disk_health", "/disks"):
         # 120s: SMART probes on a sick drive are exactly the slow case, and the

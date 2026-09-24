@@ -320,7 +320,11 @@ umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_b
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_backup.sh --deep
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/verify_backup.sh --integrity
 umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/restore_file.sh --list
-umbrel ALL=(root) NOPASSWD: /home/umbrel/umbrel/umbrel-guardian/scripts/restore_file.sh --all
+# --list only reads, so plain sudo is enough for it. --all is deliberately NOT
+# here: it writes into the umbrel data directory, which the bot's mount
+# namespace makes read-only whatever its uid, so it goes through the
+# systemd-run grant below instead. A grant with no caller is a grant nobody
+# audits.
 
 # The umbreld gateway. Five read-only queries that take no arguments, and one
 # mutation whose only wildcard is the app id — which the gateway itself
@@ -332,6 +336,32 @@ umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh syst
 umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh system.getReleaseChannel.query
 umbrel ALL=(root) NOPASSWD: /usr/local/lib/umbrel-guardian/umbreld-query.sh apps.restart.mutate --appId *
 SUDOERS_EOF
+
+# ── The two commands that have to escape the bot's mount namespace ───────────
+# umbrel-guardian-bot.service sets ProtectSystem=strict, which mounts the whole
+# hierarchy read-only apart from the Guardian directory. That is a namespace, so
+# `sudo` raises the uid and changes nothing about what is writable: a root child
+# of the bot still gets EROFS writing /etc/systemd/system or the umbrel data
+# directory. systemd-run asks PID 1 to spawn the command instead, outside the
+# sandbox, and --pipe keeps it synchronous so the bot reports a real result.
+#
+# Both lines are complete and literal. There is no wildcard, so nothing typed
+# into a chat window can reach either command line — tighter than the --appId
+# grant above, which needs one.
+#
+# Appended separately because systemd-run's path is resolved rather than
+# assumed; the heredoc above is quoted and expands nothing.
+SYSTEMD_RUN="$(command -v systemd-run 2>/dev/null || echo /usr/bin/systemd-run)"
+cat >> "$TMP_SUDOERS" <<SUDOERS_RUN_EOF
+
+# Apply the schedules in config.env to the systemd timers. Takes no arguments:
+# it reads the values itself, so this grant carries no user input at all.
+umbrel ALL=(root) NOPASSWD: $SYSTEMD_RUN --quiet --pipe --wait --collect --unit=guardian-apply-timers /usr/local/lib/umbrel-guardian/apply-timers.sh
+
+# Restore damaged config files from the backup mirror. Writes into the umbrel
+# data directory, which is why plain sudo was never enough for it.
+umbrel ALL=(root) NOPASSWD: $SYSTEMD_RUN --quiet --pipe --wait --collect --unit=guardian-restore $INSTALL_DIR/scripts/restore_file.sh --all
+SUDOERS_RUN_EOF
 # Validate with visudo before installing — a broken sudoers file breaks all sudo.
 if visudo -c -f "$TMP_SUDOERS" &>/dev/null; then
     install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_FILE"
@@ -358,6 +388,16 @@ if [ -f "$INSTALL_DIR/scripts/umbreld-query.sh" ]; then
     echo "  ✅ Deployed umbreld gateway → $PRIV_DIR/umbreld-query.sh"
 else
     echo "  ⚠️ scripts/umbreld-query.sh missing — umbreld commands will not work on umbrelOS 2.0"
+fi
+
+# Same reasoning, same place: this one is granted root and edits systemd unit
+# files, so it must not live anywhere `umbrel` can rewrite it.
+if [ -f "$INSTALL_DIR/scripts/apply-timers.sh" ]; then
+    install -o root -g root -m 0755 "$INSTALL_DIR/scripts/apply-timers.sh" \
+        "$PRIV_DIR/apply-timers.sh"
+    echo "  ✅ Deployed timer applier → $PRIV_DIR/apply-timers.sh"
+else
+    echo "  ⚠️ scripts/apply-timers.sh missing — /interval and /backup_time will not work"
 fi
 
 # Clean up the LEGACY sudoers file from a prior design (different filename)

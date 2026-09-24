@@ -76,6 +76,10 @@ If a previous `config.env` exists, the installer asks before overwriting it — 
 | `/storage` | 💾 Per-app storage usage |
 | `/notifications` | 🔔 Pending umbrelOS notifications |
 | `/updates` | 🔄 umbrelOS version, release channel, and available updates |
+| `/schedule` | 🗓 When the health check and backup next run, and the current repeat setting |
+| `/interval <15m\|30m\|1h\|3h\|12h>` | ⏱ How often the health check runs |
+| `/backup_time <HH:MM>` | 🗓 Daily backup time, 24-hour, in the system timezone |
+| `/alerts <hours>` | 🔔 How long before an unchanged problem is mentioned again (`0` = never) |
 | `/system_reboot` | 🔄 Reboot the Pi (2-step confirm; +60s grace) |
 | `/system_shutdown` | ⏻ Power off the Pi (2-step confirm; needs physical access to restart) |
 | `/restart_docker` | 🔄 Restart Docker daemon (2-step confirm; briefly interrupts all containers) |
@@ -103,6 +107,10 @@ storage - Per-app storage usage
 verify_backup - Check the backup is restorable (add: deep)
 notifications - Pending umbrelOS notifications
 updates - umbrelOS version and available updates
+schedule - When checks and backups run
+interval - How often the health check runs: /interval 15m|30m|1h|3h|12h
+backup_time - Daily backup time: /backup_time HH:MM
+alerts - Repeat an unchanged alert this often: /alerts <hours>, 0 = never
 backup - Trigger a manual backup immediately
 restart - Restart an app: /restart <app_id> or /restart unhealthy
 logs - Container logs: /logs <app_id> [lines, default 50]
@@ -148,7 +156,7 @@ To take the menu away again: `/setcommands`, pick the bot, and send a single `-`
 
 If you miss the 30-second window, the confirmation expires and you have to start over. For reboot/shutdown there's an additional **60-second grace period** after confirmation during which `/system_cancel` aborts the operation.
 
-All four commands are blocked by `/lock` (you must `/unlock <PIN>` first). They are reached through `/etc/sudoers.d/umbrel-guardian-system`, which lists **eighteen exact command lines and nothing else**: the five subcommands of `scripts/system_control.sh`, the read-only diagnostics in `disk_health.sh` and `verify_backup.sh`, the two `restore_file.sh` verbs, and the six umbreld procedures the gateway exposes. It is re-deployed on every boot by `reinstall-services.sh`, because `/etc/sudoers.d/` is wiped each boot.
+All four commands are blocked by `/lock` (you must `/unlock <PIN>` first). They are reached through `/etc/sudoers.d/umbrel-guardian-system`, which lists **nineteen exact command lines and nothing else**: the five subcommands of `scripts/system_control.sh`, the read-only diagnostics in `disk_health.sh` and `verify_backup.sh`, `restore_file.sh --list`, the six umbreld procedures the gateway exposes, and two `systemd-run` invocations — one to restore damaged files, one to apply the timer schedules. Eighteen of the nineteen carry no wildcard at all; the exception is the app id on `apps.restart.mutate`, which the gateway validates against umbrelOS's own id format before it reaches umbreld. It is re-deployed on every boot by `reinstall-services.sh`, because `/etc/sudoers.d/` is wiped each boot.
 
 ### When an app is stuck "restarting" forever
 
@@ -255,6 +263,7 @@ umbrel-guardian/
 │   ├── lib-integrity.py        ← Parses critical configs on both sides (called, not run)
 │   ├── lib-umbreld.sh          ← Shared: how to reach umbreld (sourced, not run)
 │   ├── umbreld-query.sh        ← Root-only gateway, deployed outside $INSTALL_DIR
+│   ├── apply-timers.sh         ← Root-only timer applier, deployed outside $INSTALL_DIR
 │   ├── restore_file.sh         ← Put a damaged file back from the backup
 │   ├── verify_backup.sh        ← Is the backup restorable? (fast + deep modes)
 │   ├── disk_health.sh          ← SMART / eMMC wear / kernel I/O errors (root)
@@ -313,9 +322,34 @@ aren't:
 | `BACKUP_EXCLUDE_CHURN` | `y` | Skip caches umbrelOS regenerates (app stores, thumbnails, file index) |
 | `BACKUP_ESSENTIAL_INCLUDE_HOME` | `n` | Include `home/` — your Files and Photos — in essential snapshots |
 | `BACKUP_SKIP_SPACE_CHECK` | `n` | Run a full clone even when the drive looks too small |
+| `ALERT_REPEAT_HOURS` | `24` | How long an unchanged problem stays quiet before one reminder; `0` never repeats |
 
-`HEALTH_INTERVAL` and `INSTALL_DIR` are also in the file, but both are written by
-`install.sh` and are not meant to be edited by hand.
+`INSTALL_DIR` is written by `install.sh` and is not meant to be edited by hand.
+`HEALTH_INTERVAL` and `BACKUP_TIME` are written by `install.sh` too, but both are
+yours to change afterwards — from Telegram with `/interval` and `/backup_time`,
+or by editing them here and running `sudo bash reinstall-services.sh`.
+`ALERT_REPEAT_HOURS` needs neither: `health_check.sh` reads `config.env` on every
+run, so `/alerts` takes effect at the next tick.
+
+### When you hear about a problem
+
+Guardian hashes the set of things currently wrong and compares it with the last
+run, so the schedule below is about *detection*, not about how often your phone
+buzzes:
+
+- **The moment it appears, changes, or gets worse.** Counts are bucketed in
+  orders of magnitude (`1+`, `10+`, `100+`), so a drive whose error count ticks
+  from 41 to 42 is the same finding, while `10+` becoming `100+` is a new one
+  and interrupts you again.
+- **Then once every `ALERT_REPEAT_HOURS`** for as long as it stays exactly the
+  same. Pure change-detection would mean a real failure is announced once and
+  never mentioned again; repeating every check means you stop reading the
+  alerts. A daily reminder is the compromise, and `/alerts 0` turns it off.
+- **`/health` any time**, which always reports the current state and never
+  disturbs the reminder clock.
+
+Nothing is sent when everything is fine — an all-clear only appears in reply to
+`/health` and in the 09:00 daily summary.
 
 ### Who can actually use the bot
 
@@ -376,7 +410,11 @@ The `/backup` bot command touches a trigger file. A systemd `.path` unit watches
 - 🧪 **Atomic snapshots (essential)** — rsync writes to `.tmp`, renamed on success only
 - 🏷 **Completion marker (full)** — an `.incomplete` file flags a mirror that is mid-update
 - 🚧 **Mount excludes** — `external/`, `network/` and `backups/` are never copied, so an auto-mounted drive can't be backed up into itself
-- 🗄 **Consistent database snapshot** — `umbrel.db` is captured via `sqlite3 .backup` rather than copied live (umbrelOS 2.0+)
+- 🗄 **Consistent database snapshot** — `umbrel.db` is captured through SQLite's online
+  backup API rather than copied live, using python3's built-in `sqlite3` module (the
+  `sqlite3` CLI is used instead when present, but umbrelOS does not ship it and
+  Guardian does not install it). Verified with `PRAGMA quick_check` before it replaces
+  the previous copy. umbrelOS 2.0+, which is where `umbrel.db` exists
 - 📏 **Pre-flight capacity check** — a drive too small for a full clone fails in seconds, not hours in
 - 📡 **Telegram notifications** on success and failure (naming the first real rsync error, not just the tail)
 - 🔌 **mountpoint check** — refuses to run if backup drive isn't mounted
@@ -477,7 +515,7 @@ OOMPolicy=continue
 See [umbrelOS 2.0 timing and resource limits](#umbrelos-20-timing-and-resource-limits)
 for why those numbers are what they are.
 
-> `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands, `disk_health.sh` / `verify_backup.sh` for diagnostics that need root, and `restore_file.sh` to put a damaged file back. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to an explicit list of eighteen exact command lines and nothing else.
+> `NoNewPrivileges=yes` is intentionally **not** set because the bot needs `sudo` to invoke `system_control.sh` for the four system commands, `disk_health.sh` / `verify_backup.sh` for diagnostics that need root, and — through `systemd-run` — `restore_file.sh` to put a damaged file back and `apply-timers.sh` to change a schedule. The privilege boundary is instead enforced by `/etc/sudoers.d/umbrel-guardian-system`, which grants NOPASSWD access to an explicit list of nineteen exact command lines and nothing else.
 
 ### Input Validation
 
@@ -793,6 +831,48 @@ libraries or state beside it either.
 > `umbrel`-writable directory. That is a pre-existing weakness, not one 2.0
 > introduced, and moving them needs the installer to separate code from config
 > and state. It is the next piece of work, not a solved problem.
+
+### Why two commands go through `systemd-run`
+
+`umbrel-guardian-bot.service` sets `ProtectSystem=strict`, which mounts the
+entire filesystem hierarchy read-only except for `ReadWritePaths`. That is a
+**mount namespace**, and `sudo` does not leave one: it raises the uid, and a root
+child of the bot still gets `EROFS` writing `/etc/systemd/system` or the umbrel
+data directory.
+
+This was not theoretical. `/restore all` from Telegram used to stop umbreld, fail
+every single copy, report `could not write (permission denied?)`, and start
+umbreld again — on a node whose permissions were perfect. It now reports the
+error the kernel actually gave, and refuses to stop umbreld at all until it has
+proved something is writable.
+
+So the two commands that must write outside the Guardian directory ask PID 1 to
+run them instead:
+
+```
+sudo -n systemd-run --quiet --pipe --wait --collect --unit=… <fixed command>
+```
+
+PID 1 is outside the sandbox, so the transient unit sees the real filesystem.
+`--pipe` hands it the bot's stdio, so the command stays synchronous and the bot
+reports a real result rather than "requested". Both grants are complete literal
+command lines with no wildcard, so nothing typed into a chat window reaches
+either one:
+
+| Command | What it is for |
+|---|---|
+| `scripts/restore_file.sh --all` | Writes restored configs into the umbrel data directory |
+| `apply-timers.sh` | Rewrites `OnCalendar=` in Guardian's timer units |
+
+`apply-timers.sh` lives in `/usr/local/lib/umbrel-guardian/` beside the umbreld
+gateway, for the same reason, and takes **no arguments at all** — it reads
+`HEALTH_INTERVAL` and `BACKUP_TIME` from `config.env` itself, so the sudoers
+grant carries no user input. `config.env` is `umbrel`-writable, so the script
+parses it rather than sourcing it (sourcing a caller-writable file as root is
+arbitrary code execution as root), validates the interval against a fixed list of
+five and the time against `HH:MM`, and rewrites one directive of an
+already-deployed unit rather than redeploying it from a template under
+`/home/umbrel`.
 
 ## 🛠 Useful Commands
 
