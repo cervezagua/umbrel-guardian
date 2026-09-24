@@ -3,8 +3,9 @@
 # if disk usage exceeds threshold or any app is in an unknown/failed state.
 # (Healthy = ready or running; transient and stopped states are ignored.)
 #
-# Deduplication: alerts are only sent when the issue set *changes*,
-# preventing Telegram spam every 30 minutes for persistent problems.
+# Deduplication: an alert is sent when the issue set *changes*, and then once
+# every ALERT_REPEAT_HOURS (default 24) while it stays the same, so a persistent
+# problem neither spams the chat nor drops off it entirely.
 #
 # Pass --force to always send the current status (used by /health command).
 #
@@ -23,11 +24,33 @@ SEND="$SCRIPT_DIR/telegram_send.sh"
 source "$CONFIG"
 
 THRESHOLD="${DISK_THRESHOLD:-90}"
-STATE_FILE="/run/umbrel-guardian-health.last"
-# Persistent state, unlike STATE_FILE above: /run is tmpfs and resets on every
-# boot, which is exactly wrong for anything describing the previous one.
 STATE_DIR="$(dirname "$SCRIPT_DIR")/.state"
+# The dedup fingerprint. It lived at /run/umbrel-guardian-health.last and that
+# was wrong twice over.
+#
+# /run is tmpfs, so the hash died at every reboot and every outstanding issue
+# was re-announced on the next tick — the exact failure reinstall-services.sh
+# already warns about where it creates this directory. Worse, /run is
+# root-owned and this script runs as the umbrel user with no RuntimeDirectory=,
+# so the write never landed at all: the hash read back empty on every single
+# run and deduplication has never once worked. It went unnoticed for as long as
+# it did because an empty issue list short-circuits the send, so nothing
+# repeated until the first problem that never clears — a failing SD card,
+# reported hourly, forever.
+#
+# Two lines of defence now: the file lives beside every other latch, in a
+# directory this user owns, and save_state() below says so in the journal if it
+# still cannot write. A suppression mechanism that fails open in silence is
+# indistinguishable from one that works.
+STATE_FILE="$STATE_DIR/health.last"
 HOST="$(hostname)"
+
+# How long an unchanged, still-present problem stays quiet before one reminder.
+# Pure change-detection would mean a real failure alerts once and is never
+# mentioned again; hourly repetition means you stop reading the alerts. A daily
+# nudge is the compromise. 0 disables reminders entirely.
+ALERT_REPEAT_HOURS="${ALERT_REPEAT_HOURS:-24}"
+[[ "$ALERT_REPEAT_HOURS" =~ ^[0-9]+$ ]] || ALERT_REPEAT_HOURS=24
 
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
@@ -250,7 +273,37 @@ ISSUE_COUNT="${#ISSUES[@]}"
 # re-alert. Pinning the collation makes the fingerprint depend only on content.
 STATE_TEXT="$(printf "%s\n" "${ISSUES[@]}" 2>/dev/null | LC_ALL=C sort)"
 CURRENT_HASH="$(printf "%s" "$STATE_TEXT" | sha256sum | awk '{print $1}')"
-LAST_HASH="$(cat "$STATE_FILE" 2>/dev/null || true)"
+
+# "<hash> <epoch-of-last-send>". One file, not two: the epoch is what makes the
+# reminder possible, and keeping it here means testing the reminder is a matter
+# of rewriting this number rather than faking a clock.
+LAST_HASH=""
+LAST_SENT=0
+# Brace-grouped: a failed input redirection is reported by the shell BEFORE the
+# command's own 2>/dev/null can suppress it, so on a node without the file yet
+# the bare form fills the journal with "No such file or directory" every run.
+{ read -r LAST_HASH LAST_SENT < "$STATE_FILE"; } 2>/dev/null || true
+[[ "${LAST_SENT:-}" =~ ^[0-9]+$ ]] || LAST_SENT=0
+NOW_EPOCH="$(date +%s)"
+
+# Temp file plus mv, so an interrupted write cannot leave a truncated hash that
+# matches nothing and re-alerts forever.
+#
+# The failure path is the point. This write failing silently is the whole bug
+# being fixed here, so if it fails again it says so somewhere a person can find
+# it: stderr reaches the journal via StandardError=journal in the unit.
+save_state() {
+    local tmp="${STATE_FILE}.tmp.$$"
+    if { printf '%s %s\n' "$1" "$2" > "$tmp"; } 2>/dev/null &&
+       mv -f "$tmp" "$STATE_FILE" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    echo "guardian: cannot write $STATE_FILE — alert deduplication is disabled," \
+         "so every run with an outstanding issue will re-alert. Check that" \
+         "$STATE_DIR exists and is writable by $(id -un)." >&2
+    return 1
+}
 
 send_ok() {
     "$SEND" "✅ Health check OK on ${HOST}"
@@ -268,7 +321,11 @@ send_issues() {
 SENT=0
 
 if [[ "$FORCE" -eq 1 ]]; then
-    # Manual /health — always respond with current state
+    # Manual /health — always respond with current state.
+    #
+    # Deliberately does not touch the state file. Asking "how are things?" must
+    # not reset the reminder clock, or checking in often enough would silence
+    # the daily nudge about a problem you have not fixed.
     if [ "$ISSUE_COUNT" -eq 0 ]; then
         send_ok
     else
@@ -276,13 +333,23 @@ if [[ "$FORCE" -eq 1 ]]; then
     fi
     SENT=1
 elif [[ "$CURRENT_HASH" != "$LAST_HASH" ]]; then
-    # State changed — send notification
+    # The issue set changed — a new problem, a resolved one, or an escalation.
+    # Always worth saying at once, which is why disk_health.sh buckets its
+    # counts: a number that drifts would land here on every run.
     if [ "$ISSUE_COUNT" -gt 0 ]; then
         send_issues
         SENT=1
     fi
-    # Save new state (whether issues or all-clear, so we detect recovery)
-    echo "$CURRENT_HASH" > "$STATE_FILE"
+    # Save whether or not anything was sent, so recovery is detected too. The
+    # epoch is 0 for an all-clear: nothing was announced, so there is nothing
+    # to remind anyone about.
+    save_state "$CURRENT_HASH" "$( [ "$SENT" -eq 1 ] && echo "$NOW_EPOCH" || echo 0 )"
+elif [ "$ISSUE_COUNT" -gt 0 ] && [ "$ALERT_REPEAT_HOURS" -gt 0 ] &&
+     [ "$(( NOW_EPOCH - LAST_SENT ))" -ge "$(( ALERT_REPEAT_HOURS * 3600 ))" ]; then
+    # Unchanged and still broken. One reminder, then quiet again.
+    send_issues
+    SENT=1
+    save_state "$CURRENT_HASH" "$NOW_EPOCH"
 fi
 
 # ── Side channels ────────────────────────────────────────────────────────────

@@ -352,6 +352,9 @@ BACKUP_TIME=${BACKUP_TIME}
 BACKUP_KEEP=3
 AUTO_MOUNT=${AUTO_MOUNT:-n}
 DISK_THRESHOLD=90
+# Hours before an unchanged problem is mentioned again. 0 = never. /alerts <n>
+ALERT_REPEAT_HOURS=24
+# Change with /interval or by editing this and re-running reinstall-services.sh
 HEALTH_INTERVAL=${HEALTH_INTERVAL}
 INSTALL_DIR=${INSTALL_DIR}
 LOCK_PIN=${LOCK_PIN}
