@@ -248,14 +248,31 @@ if [ "${#BACKUP_CANDIDATES[@]}" -gt 0 ]; then
         esac
 
         echo
+        # The schedule becomes `OnCalendar=*-*-* HH:MM:00` with no timezone
+        # suffix, and systemd reads that in the SYSTEM timezone. This prompt
+        # used to detect the real zone, print it, and then insist the time be
+        # entered in UTC — true on a stock node, silently an hour or more wrong
+        # on one that has been re-zoned, with the installer having promised
+        # otherwise. Name the zone the schedule will actually follow.
         LOCAL_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)
         LOCAL_TIME=$(date +%H:%M)
         UTC_TIME=$(date -u +%H:%M)
         echo "  ⏰ Server time: $LOCAL_TIME ($LOCAL_TZ) | UTC: $UTC_TIME"
-        echo "  Enter the time in UTC. Umbrel OS always runs in UTC."
-        read -rp "  Daily backup time in UTC, 24h format [02:00]: " INPUT
-        BACKUP_TIME="${INPUT:-02:00}"
-        ok "Backup scheduled at $BACKUP_TIME UTC daily ($BACKUP_SCOPE scope)"
+        echo "  The backup runs on the system clock — ${LOCAL_TZ}, shown above."
+        echo "  (umbrelOS ships as UTC; 'timedatectl' says what yours is set to.)"
+        # Validated and zero-padded here, because this is where the bad value
+        # came from: it was stored verbatim, so `2:00` reached config.env and
+        # every later reader had to cope with two formats.
+        while :; do
+            read -rp "  Daily backup time, 24h HH:MM [02:00]: " INPUT
+            INPUT="${INPUT:-02:00}"
+            if [[ "$INPUT" =~ ^([0-9]|[01][0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+                BACKUP_TIME="$(printf '%02d:%s' "$((10#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}")"
+                break
+            fi
+            warn "'$INPUT' is not a 24-hour time. Examples: 02:00, 5:30, 23:15"
+        done
+        ok "Backup scheduled at $BACKUP_TIME ($LOCAL_TZ) daily ($BACKUP_SCOPE scope)"
 
         # Auto-mount by label — avoids the Umbrel dual-drive boot problem
         echo

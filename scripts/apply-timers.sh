@@ -66,6 +66,9 @@ BACKUP_PATH="$(config_value BACKUP_PATH)"
 
 CHANGED=0
 PROBLEMS=0
+# Units whose OnCalendar this run actually rewrote. Only these get restarted,
+# and only these get their catch-up suppressed — see restart_rescheduled().
+RESCHEDULED=()
 
 # The five forms install.sh offers, and nothing else. Kept as one list here and
 # in install.sh so the menu and this script cannot drift into disagreeing about
@@ -75,6 +78,20 @@ health_interval_ok() {
         '*:0/15'|'*:0/30'|hourly|'0/3:00'|'0/12:00') return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# A 24-hour time, zero-padded, or nothing.
+#
+# `H:MM` is accepted and padded rather than refused. install.sh took the backup
+# time with no validation for its whole life, so `BACKUP_TIME=2:00` is sitting in
+# real config.env files, and systemd has been happily running `OnCalendar=*-*-*
+# 2:00:00` from it — non-padded hours are valid there. Refusing it made the
+# validator wrong about working input: `/interval 3h` reported a backup-time
+# error while doing something unrelated to backups.
+normalise_hhmm() {
+    local value="$1"
+    [[ "$value" =~ ^([0-9]|[01][0-9]|2[0-3]):([0-5][0-9])$ ]] || return 1
+    printf '%02d:%s\n' "$((10#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}"
 }
 
 # Rewrite one directive in a unit that is already deployed. The value cannot
@@ -92,15 +109,37 @@ set_oncalendar() {
 }
 
 # systemd's own answer, rather than ours, so a mistake in the calendar spec
-# shows up as "unknown" here instead of as a timer that silently never fires.
+# shows up here instead of as a timer that silently never fires.
+#
+# Take whatever form systemd gives. `systemctl show` special-cases
+# NextElapseUSecRealtime and prints a FORMATTED timestamp ("Wed 2026-09-24
+# 09:00:00 UTC"), not the raw microseconds the property name suggests. Demanding
+# digits threw the right answer away and reported "unknown" for two perfectly
+# healthy timers. Both forms are handled now, because which one you get is a
+# systemd-version detail and not worth depending on.
+#
+# And when there is genuinely nothing, say what was observed. "unknown" that
+# does not name its cause is the failure this project keeps having to fix.
 next_fire() {
-    local unit="$1" usec
-    usec="$(systemctl show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null)"
-    if [[ "${usec:-}" =~ ^[0-9]+$ ]] && [ "$usec" -gt 0 ]; then
-        date -d "@$(( usec / 1000000 ))" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null
-    else
-        echo "unknown"
+    local unit="$1" value load active
+    value="$(systemctl show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null | tr -d '\r')"
+
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        if [ "$value" -gt 0 ]; then
+            date -d "@$(( value / 1000000 ))" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null && return 0
+        fi
+    elif [ -n "$value" ] && [ "$value" != "n/a" ] && [ "$value" != "infinity" ]; then
+        printf '%s\n' "$value"
+        return 0
     fi
+
+    load="$(systemctl show "$unit" -p LoadState --value 2>/dev/null)"
+    active="$(systemctl show "$unit" -p ActiveState --value 2>/dev/null)"
+    case "${load:-}" in
+        loaded) echo "none scheduled (timer is ${active:-unknown})" ;;
+        "")     echo "cannot ask systemd" ;;
+        *)      echo "not installed (${load})" ;;
+    esac
 }
 
 # ── Health check ─────────────────────────────────────────────────────────────
@@ -116,7 +155,8 @@ elif [ ! -f "$HEALTH_TIMER" ]; then
 else
     set_oncalendar "$HEALTH_TIMER" "$HEALTH_INTERVAL"
     case $? in
-        0) CHANGED=1; echo "✅ Health check interval set to $HEALTH_INTERVAL" ;;
+        0) CHANGED=1; RESCHEDULED+=(umbrel-guardian-health.timer)
+           echo "✅ Health check interval set to $HEALTH_INTERVAL" ;;
         2) echo "ℹ️ Health check interval already $HEALTH_INTERVAL" ;;
         *) echo "❌ Could not rewrite $HEALTH_TIMER"; PROBLEMS=$((PROBLEMS + 1)) ;;
     esac
@@ -131,8 +171,8 @@ if [ -z "$BACKUP_PATH" ]; then
     echo "ℹ️ Backups are not configured (BACKUP_PATH is empty) — no backup timer to set"
 elif [ -z "$BACKUP_TIME" ]; then
     echo "ℹ️ BACKUP_TIME is not set in config.env — backup timer left as it is"
-elif ! [[ "$BACKUP_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
-    echo "❌ BACKUP_TIME='$BACKUP_TIME' is not a 24-hour HH:MM — backup timer not changed"
+elif ! BACKUP_TIME="$(normalise_hhmm "$BACKUP_TIME")"; then
+    echo "❌ BACKUP_TIME='$(config_value BACKUP_TIME)' is not a 24-hour HH:MM — backup timer not changed"
     PROBLEMS=$((PROBLEMS + 1))
 elif [ ! -f "$BACKUP_TIMER" ]; then
     echo "❌ $BACKUP_TIMER is not installed — run: sudo bash $INSTALL_DIR/reinstall-services.sh"
@@ -140,23 +180,57 @@ elif [ ! -f "$BACKUP_TIMER" ]; then
 else
     set_oncalendar "$BACKUP_TIMER" "*-*-* ${BACKUP_TIME}:00"
     case $? in
-        0) CHANGED=1; echo "✅ Daily backup time set to $BACKUP_TIME" ;;
+        0) CHANGED=1; RESCHEDULED+=(umbrel-guardian-backup.timer)
+           echo "✅ Daily backup time set to $BACKUP_TIME" ;;
         2) echo "ℹ️ Daily backup time already $BACKUP_TIME" ;;
         *) echo "❌ Could not rewrite $BACKUP_TIMER"; PROBLEMS=$((PROBLEMS + 1)) ;;
     esac
 fi
 
-# ── Make systemd notice ──────────────────────────────────────────────────────
+# ── Make systemd notice, without running anything ────────────────────────────
 # Restart, not reload: a timer re-reads OnCalendar when it is restarted, and
 # daemon-reload alone leaves the running timer on its old schedule.
+#
+# The stamp file is the part that is not obvious, and skipping it cost a live
+# node an unrequested full backup. Every Guardian timer sets Persistent=true, so
+# on start systemd compares /var/lib/systemd/timers/stamp-<unit> against the most
+# recent occurrence of the calendar expression and fires AT ONCE if a run looks
+# missed. Move a 02:00 backup to 05:00 at 08:14 and the 05:00 slot is suddenly in
+# the past and unaccounted for, so the timer "catches up" — a full clone nobody
+# asked for, onto a drive, on hardware that may be the reason you were changing
+# the schedule in the first place.
+#
+# Asking for a different time is not asking to run now. Touch the stamp to the
+# current moment before starting, so the new schedule begins from here. Only for
+# a timer this run actually rewrote: an untouched timer keeps normal catch-up, so
+# a node that was powered off through its backup window still catches up at boot.
+STAMP_DIR=/var/lib/systemd/timers
+restart_rescheduled() {
+    # Two statements, not one `local`: a variable assigned in the same `local`
+    # is not yet visible to the one beside it, so the stamp path would come out
+    # as "stamp-" and both timers would collide on it.
+    local unit="$1"
+    local stamp="$STAMP_DIR/stamp-$unit"
+    systemctl stop "$unit" 2>/dev/null || true
+    if mkdir -p "$STAMP_DIR" 2>/dev/null && : > "$stamp" 2>/dev/null; then
+        touch "$stamp" 2>/dev/null || true
+    else
+        # Worth saying: without the stamp the timer may fire the moment it
+        # starts, and that is exactly the surprise this function exists to stop.
+        echo "⚠️ Could not write $stamp — $unit may run once immediately"
+    fi
+    systemctl start "$unit" 2>/dev/null \
+        || { echo "⚠️ Could not start $unit"; PROBLEMS=$((PROBLEMS + 1)); }
+}
+
 if [ "$CHANGED" -eq 1 ]; then
     systemctl daemon-reload 2>/dev/null || true
-    for UNIT in umbrel-guardian-health.timer umbrel-guardian-backup.timer; do
+    for UNIT in ${RESCHEDULED[@]+"${RESCHEDULED[@]}"}; do
         [ -f "$SYSTEMD_DIR/$UNIT" ] || continue
         systemctl is-enabled --quiet "$UNIT" 2>/dev/null || continue
-        systemctl restart "$UNIT" 2>/dev/null \
-            || { echo "⚠️ Could not restart $UNIT"; PROBLEMS=$((PROBLEMS + 1)); }
+        restart_rescheduled "$UNIT"
     done
+    echo "ℹ️ Rescheduled only — nothing was run now."
 fi
 
 # ── Report what systemd now believes ─────────────────────────────────────────

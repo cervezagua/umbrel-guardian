@@ -78,7 +78,7 @@ If a previous `config.env` exists, the installer asks before overwriting it — 
 | `/updates` | 🔄 umbrelOS version, release channel, and available updates |
 | `/schedule` | 🗓 When the health check and backup next run, and the current repeat setting |
 | `/interval <15m\|30m\|1h\|3h\|12h>` | ⏱ How often the health check runs |
-| `/backup_time <HH:MM>` | 🗓 Daily backup time, 24-hour, in the system timezone |
+| `/backup_time <HH:MM>` | 🗓 Daily backup time, 24-hour, in the system timezone. Reschedules only — it never runs a backup |
 | `/alerts <hours>` | 🔔 How long before an unchanged problem is mentioned again (`0` = never) |
 | `/system_reboot` | 🔄 Reboot the Pi (2-step confirm; +60s grace) |
 | `/system_shutdown` | ⏻ Power off the Pi (2-step confirm; needs physical access to restart) |
@@ -109,7 +109,7 @@ notifications - Pending umbrelOS notifications
 updates - umbrelOS version and available updates
 schedule - When checks and backups run
 interval - How often the health check runs: /interval 15m|30m|1h|3h|12h
-backup_time - Daily backup time: /backup_time HH:MM
+backup_time - Reschedule the daily backup: /backup_time HH:MM (24h)
 alerts - Repeat an unchanged alert this often: /alerts <hours>, 0 = never
 backup - Trigger a manual backup immediately
 restart - Restart an app: /restart <app_id> or /restart unhealthy
@@ -350,6 +350,26 @@ buzzes:
 
 Nothing is sent when everything is fine — an all-clear only appears in reply to
 `/health` and in the 09:00 daily summary.
+
+### Changing a schedule never runs the job
+
+`/interval` and `/backup_time` reschedule and nothing else. That is worth
+stating because systemd's default is the opposite: every Guardian timer sets
+`Persistent=true`, so on start it compares its stamp file against the last
+occurrence of the calendar expression and fires immediately if a run looks
+missed. Move a 02:00 backup to 05:00 at 08:14 and the 05:00 slot is suddenly in
+the past and unaccounted for — so the timer "catches up" with a full clone
+nobody asked for. Guardian writes the stamp forward when it reschedules a timer,
+so the new schedule starts from now.
+
+Catch-up still works everywhere it should: a timer whose schedule did not change
+is never touched, so a node that was powered off through its backup window still
+runs the missed backup at the next boot.
+
+Times are 24-hour `HH:MM` and follow the **system clock**, not UTC —
+`OnCalendar` carries no timezone suffix, so systemd reads it in whatever
+`timedatectl` reports. umbrelOS ships as UTC; if yours has been changed, the
+schedule follows the change.
 
 ### Who can actually use the bot
 

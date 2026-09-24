@@ -411,26 +411,67 @@ def run_outside_sandbox(unit, argv, timeout=60):
     return (result.stdout.strip() or stderr.strip()) or "(no output)"
 
 
-def next_timer_fire(unit):
-    """When systemd will next run a timer, or why it will not.
+def normalise_hhmm(value):
+    """'2:00' -> '02:00'. None if it is not a 24-hour time at all.
+
+    A single-digit hour is accepted rather than refused because install.sh
+    stored the backup time unvalidated for its whole life, so real config.env
+    files carry `BACKUP_TIME=2:00` — and systemd has been running them happily,
+    since OnCalendar accepts a non-padded hour. Rejecting it made Guardian wrong
+    about input that works.
+    """
+    match = re.match(r'^([0-9]|[01][0-9]|2[0-3]):([0-5][0-9])$', (value or "").strip())
+    if not match:
+        return None
+    return "%02d:%s" % (int(match.group(1)), match.group(2))
+
+
+def _systemctl_value(unit, prop):
+    """One `systemctl show` property, or None if systemd cannot be asked.
 
     Unprivileged: `systemctl show` reads properties over D-Bus and needs no
     root, so this stays usable in safe mode where the setters are blocked.
     """
     try:
         result = subprocess.run(
-            ["systemctl", "show", unit, "-p", "NextElapseUSecRealtime", "--value"],
+            ["systemctl", "show", unit, "-p", prop, "--value"],
             capture_output=True, text=True, timeout=10
         )
     except Exception:
-        return "unknown"
-    raw = (result.stdout or "").strip()
-    if not raw.isdigit() or int(raw) == 0:
-        # 0 or empty means the timer is not loaded, not enabled, or has no
-        # future elapse — all worth saying out loud rather than printing a date
-        # that does not exist.
-        return "not scheduled"
-    return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(int(raw) // 1_000_000))
+        return None
+    return (result.stdout or "").strip()
+
+
+def next_timer_fire(unit):
+    """When systemd will next run a timer, or why it will not.
+
+    Takes whatever form systemd hands back. `systemctl show` special-cases
+    NextElapseUSecRealtime and prints a FORMATTED timestamp ("Wed 2026-09-24
+    09:00:00 UTC") rather than the microseconds its name implies. Requiring
+    digits threw that away and reported "not scheduled" for two healthy timers.
+    Both forms are handled, because which one you get is a systemd-version
+    detail not worth depending on.
+
+    When there is genuinely nothing, name what was observed. An "unknown" that
+    does not say why is the failure this project keeps having to fix.
+    """
+    value = _systemctl_value(unit, "NextElapseUSecRealtime")
+    if value is None:
+        return "cannot ask systemd"
+    if value.isdigit():
+        if int(value) > 0:
+            return time.strftime("%Y-%m-%d %H:%M:%S %Z",
+                                 time.localtime(int(value) // 1_000_000))
+    elif value and value not in ("n/a", "infinity"):
+        return value
+
+    load = _systemctl_value(unit, "LoadState") or ""
+    active = _systemctl_value(unit, "ActiveState") or "unknown"
+    if load == "loaded":
+        return f"none scheduled (timer is {active})"
+    if not load:
+        return "cannot ask systemd"
+    return f"not installed ({load})"
 
 
 # The five forms install.sh offers and apply-timers.sh accepts, keyed by what a
@@ -762,7 +803,11 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
         cfg_now = load_config(CONFIG_PATH)
         raw = cfg_now.get("HEALTH_INTERVAL", "").strip()
         health = HEALTH_INTERVAL_LABELS.get(raw, raw or "(unset)")
-        backup = cfg_now.get("BACKUP_TIME", "").strip() or "(unset)"
+        # Displayed padded even when config.env holds a legacy "2:00", so the
+        # chat is consistent without a write. apply-timers.sh normalises the same
+        # value on its own side; the bot stays config.env's only writer.
+        backup = normalise_hhmm(cfg_now.get("BACKUP_TIME", "")) \
+            or (cfg_now.get("BACKUP_TIME", "").strip() or "(unset)")
         repeat = cfg_now.get("ALERT_REPEAT_HOURS", "24").strip()
         lines = [
             "🗓 Schedules",
@@ -816,10 +861,13 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
 
     elif lower.startswith("/backup_time"):
         parts = text.split()
-        if len(parts) != 2 or not re.match(r'^([01][0-9]|2[0-3]):[0-5][0-9]$', parts[1]):
+        when = normalise_hhmm(parts[1]) if len(parts) == 2 else None
+        if when is None:
             send_message(token, chat_id,
-                         "Usage: /backup_time HH:MM  (24-hour)\n"
-                         "Example: /backup_time 03:30")
+                         "Usage: /backup_time HH:MM  (24-hour, system timezone)\n"
+                         "Example: /backup_time 03:30\n\n"
+                         "This reschedules the daily backup. It does not run one — "
+                         "use /backup for that.")
             return
         cfg_now = load_config(CONFIG_PATH)
         if not cfg_now.get("BACKUP_PATH", "").strip():
@@ -827,12 +875,14 @@ def handle_command(text, token, chat_id, chat_ids, cfg):
                          "ℹ️ Backups are not configured (BACKUP_PATH is empty in config.env), "
                          "so there is no backup timer to reschedule.")
             return
-        written, why = set_config_value("BACKUP_TIME", parts[1])
+        # Stored padded, so config.env converges on one format no matter which
+        # form was typed or what the installer left behind.
+        written, why = set_config_value("BACKUP_TIME", when)
         if not written:
             send_message(token, chat_id, f"⚠️ Could not write config.env: {why}")
             return
         out = run_outside_sandbox("guardian-apply-timers", [APPLY_TIMERS], timeout=60)
-        broadcast(token, chat_ids, f"🗓 Daily backup time → {parts[1]}\n{out}")
+        broadcast(token, chat_ids, f"🗓 Daily backup time → {when}\n{out}")
 
     elif lower.startswith("/alerts"):
         parts = text.split()

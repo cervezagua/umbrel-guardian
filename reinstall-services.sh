@@ -267,7 +267,18 @@ cp "$INSTALL_DIR/services/umbrel-guardian-daily.timer"   "$SYSTEMD_DIR/"
 if [ -n "${BACKUP_PATH:-}" ]; then
     cp "$INSTALL_DIR/services/umbrel-guardian-backup.service" "$SYSTEMD_DIR/"
 
+    # Zero-padded here too. config.env is hand-editable and older installs hold
+    # an unpadded "2:00" from a prompt that never validated, so both writers of
+    # this unit have to agree on the format or /schedule reports one thing and
+    # systemd runs another. An unrecognisable value falls back to the default
+    # rather than producing a timer that never fires.
     BACKUP_TIME="${BACKUP_TIME:-02:00}"
+    if [[ "$BACKUP_TIME" =~ ^([0-9]|[01][0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+        BACKUP_TIME="$(printf '%02d:%s' "$((10#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}")"
+    else
+        echo "  ⚠️ BACKUP_TIME='$BACKUP_TIME' is not a 24-hour HH:MM — using 02:00"
+        BACKUP_TIME="02:00"
+    fi
     sed "s|OnCalendar=.*|OnCalendar=*-*-* ${BACKUP_TIME}:00|" \
         "$INSTALL_DIR/services/umbrel-guardian-backup.timer" \
         > "$SYSTEMD_DIR/umbrel-guardian-backup.timer"
