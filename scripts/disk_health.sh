@@ -204,6 +204,7 @@ describe() {
     local key="$1" lbl; lbl=$(label "$2")
     case "$key" in
         ioerr:*)         echo "🚨 ${key#ioerr:}: $lbl kernel I/O errors — the drive is failing reads or writes" ;;
+        fserr:*)         echo "🚨 ${key#fserr:}: $lbl filesystem errors — the filesystem is damaged, not necessarily the drive. Repair with e2fsck while it is unmounted" ;;
         usbreset:*)      echo "⚠️ usb ${key#usbreset:}: $lbl bus resets — check the cable and the power supply" ;;
         medium)          echo "🚨 $lbl unrecoverable medium errors — a drive has bad sectors" ;;
         readonly)        echo "🚨 A filesystem was remounted read-only — the kernel gave up on writes" ;;
@@ -303,6 +304,16 @@ count_stream() {
         match($0, /Buffer I\/O error on device [a-zA-Z0-9]+/) {
             d = substr($0, RSTART + 27, RLENGTH - 27); sub(/p?[0-9]+$/, "", d); ioerr[d]++; next
         }
+        # "EXT4-fs error (device sda1): ext4_lookup:1789: ... deleted inode
+        # referenced" is filesystem damage, NOT a failing disk, and the two need
+        # opposite remedies: e2fsck offline versus replacing hardware. Counting
+        # these as I/O errors once told a node with a perfectly healthy drive
+        # (clean SMART, zero CRC errors) that "the drive is failing". After the
+        # two I/O-error matches, so a genuine I/O error line still counts as
+        # one. The partition name is kept, because that is what e2fsck takes.
+        match($0, /EXT4-fs error \(device [a-zA-Z0-9]+\)/) {
+            d = substr($0, RSTART + 22, RLENGTH - 23); fserr[d]++; next
+        }
         /critical medium error|Medium Error|Unrecovered read error/ { medium++; next }
         # "usb 2-1: reset SuperSpeed USB device number 3". Extract from the match,
         # never by splitting on ":" — the timestamp is full of colons.
@@ -315,6 +326,7 @@ count_stream() {
         END {
             for (d in ioerr)    print "ioerr:" d " " ioerr[d]
             for (d in usbreset) print "usbreset:" d " " usbreset[d]
+            for (d in fserr)    print "fserr:" d " " fserr[d]
             if (medium + 0 > 0) print "medium " (medium + 0)
             if (ro + 0 > 0)     print "readonly " (ro + 0)
             if (maxts + 0 > 0)  printf "__watermark__ %.6f\n", maxts
