@@ -71,7 +71,7 @@ If a previous `config.env` exists, the installer asks before overwriting it — 
 | `/logs <app_id> [n]` | 📋 Last N lines of an app's container logs (default: 50) |
 | `/backup` | ⏳ Trigger a manual backup immediately |
 | `/verify_backup` | 🔍 Check the backup is actually restorable — including whether its files still parse (add `deep` for a full file-by-file compare) |
-| `/disk_health` | 🩺 Kernel I/O errors, SMART attributes, SD/eMMC wear (alias: `/disks`) |
+| `/disk_health` | 🩺 Kernel I/O errors, filesystem (ext4) errors, SMART attributes, SD/eMMC wear (alias: `/disks`). A filesystem error means damaged metadata, not a failing drive — repair with `e2fsck` while unmounted |
 | `/restore` | 🛟 List config files damaged here but intact in the backup; `/restore all` puts them back (blocked by `/lock` — it writes) |
 | `/storage` | 💾 Per-app storage usage |
 | `/notifications` | 🔔 Pending umbrelOS notifications |
