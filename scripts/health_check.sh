@@ -228,21 +228,28 @@ if [ -x "$DISK_HEALTH" ]; then
 fi
 
 # ── Unclean shutdown ─────────────────────────────────────────────────────────
-# Written by the pre-start hook when the previous boot's shutdown marker was
-# still present, meaning the machine lost power rather than shutting down.
+# Written by boot-marker.sh when the previous boot's shutdown marker was still
+# present, meaning the machine lost power rather than shutting down.
 #
 # Worth interrupting someone for, because it is the most likely cause of the
 # config corruption the integrity check below hunts for, it leaves no kernel
-# error behind, and unlike failing hardware it is completely preventable. The
-# file carries the boot id it was recorded for, so the warning describes the
-# boot you are actually in and goes quiet after the next clean shutdown rather
-# than accusing you indefinitely.
+# error behind, and unlike failing hardware it is completely preventable.
+#
+# But it is an EVENT, not a state. It used to join ISSUES, where the daily
+# reminder re-sent it every 24 hours for as long as the machine stayed up —
+# nagging about a power cut that was over and that nothing could now fix. It is
+# announced once per boot instead, recorded by boot id so a reboot that was
+# itself unclean is announced afresh. /health still reports it on request.
 UNCLEAN_FILE="$STATE_DIR/unclean-shutdown"
+UNCLEAN_ANNOUNCED="$STATE_DIR/unclean-announced"
+UNCLEAN_MSG="⚠️ The last shutdown was unclean (power loss or held button). This is the most common cause of corrupted config files — always use 'sudo shutdown -h now' or the dashboard. If the data drive was unmounted before rebooting (e.g. for e2fsck), this can be a false alarm."
+UNCLEAN_NOW=0
+CURRENT_BOOT=$(cat "${GUARDIAN_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null || echo unknown)
 if [ -f "$UNCLEAN_FILE" ]; then
     RECORDED_BOOT=$(head -n1 "$UNCLEAN_FILE" 2>/dev/null || true)
-    CURRENT_BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
     if [ -n "${RECORDED_BOOT:-}" ] && [ "$RECORDED_BOOT" = "$CURRENT_BOOT" ]; then
-        ISSUES+=("⚠️ The last shutdown was unclean (power loss or held button). This is the most common cause of corrupted config files — always use 'sudo shutdown -h now' or the dashboard.")
+        UNCLEAN_NOW=1
+        [ "$FORCE" -eq 1 ] && ISSUES+=("$UNCLEAN_MSG")
     fi
 fi
 
@@ -350,6 +357,14 @@ elif [ "$ISSUE_COUNT" -gt 0 ] && [ "$ALERT_REPEAT_HOURS" -gt 0 ] &&
     send_issues
     SENT=1
     save_state "$CURRENT_HASH" "$NOW_EPOCH"
+fi
+
+# ── Unclean shutdown: once per boot ─────────────────────────────────────────
+if [ "$UNCLEAN_NOW" -eq 1 ] && [ "$FORCE" -eq 0 ] &&
+   [ "$(cat "$UNCLEAN_ANNOUNCED" 2>/dev/null)" != "$CURRENT_BOOT" ]; then
+    "$SEND" "🚨 Health issues on ${HOST}:
+- $UNCLEAN_MSG" && SENT=1
+    { printf '%s\n' "$CURRENT_BOOT" > "$UNCLEAN_ANNOUNCED"; } 2>/dev/null || true
 fi
 
 # ── Side channels ────────────────────────────────────────────────────────────
